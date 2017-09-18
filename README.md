@@ -1,8 +1,36 @@
 # What it is? 
 
-clj-zip-meta is an early first stab at reading zip file meta data from clojure as defined by the [zip file specification](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT). 
+clj-zip-meta reads zip/jar files and returns the contained meta data (as defined by the [zip file specification](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT), as clojure data structures.
 
-The library is able to read zip meta data and return it as clojure data structures. It reads the data as god and the zip file specification intended, by scanning from the end of the file for the end-of-central-directory record and locating the central directory based on the end-of-central-directory record. This is in contrast to a number of zip implementations out there which break if the zip file has prefix bytes before the data (like self extracting zip files).
+A zip/jar file has the general format: 
+
+```
+      [local file header 1]
+      [encryption header 1]
+      [file data 1]
+      [data descriptor 1]
+      . 
+      .
+      .
+      [local file header n]
+      [encryption header n]
+      [file data n]
+      [data descriptor n]
+      
+      [archive decryption header] 
+      [archive extra data record] 
+      
+      [central directory header 1]
+      .
+      .
+      .
+      [central directory header n]
+      [zip64 end of central directory record]
+      [zip64 end of central directory locator] 
+      [end of central directory record]
+```
+
+This library reads the meta data (local headers, central directory headers, and end of central directory record) data as god and the zip file specification intended, by scanning from the end of the file for the end-of-central-directory record and locating the central directory based on the end-of-central-directory record. This is in contrast to a number of zip implementations out there which break if the zip file has prefix bytes before the data (like self extracting zip files).
 
 Note that the aim of this library is quite different and way more detailed than what implementations such as java's ZipFile and friends does. The goal of this libray is to give the user unfettered read/write access to the binary layer of zip files. 
 
