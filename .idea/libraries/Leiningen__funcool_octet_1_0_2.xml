@@ -1,0 +1,9 @@
+<component name="libraryTable">
+  <library name="Leiningen: funcool/octet:1.0.2">
+    <CLASSES>
+      <root url="jar://$MAVEN_REPOSITORY$/funcool/octet/1.0.2/octet-1.0.2.jar!/" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>
