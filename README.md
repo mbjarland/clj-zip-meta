@@ -4,7 +4,9 @@ clj-zip-meta is an early first stab at reading zip file meta data from clojure a
 
 The library is able to read zip meta data and return it as clojure data structures. It reads the data as god and the zip file specification intended, by scanning from the end of the file for the end-of-central-directory record and locating the central directory based on the end-of-central-directory record. This is in contrast to a number of zip implementations out there which break if the zip file has prefix bytes before the data (like self extracting zip files).
 
-Note that what this library is aiming at doing is quite different and way more detailed than what implementations such as java's ZipFile and friends does. This implementation is also able to (within reason) read meta data for corrupt zip files which other implementations might just give up with. 
+Note that the aim of this library is quite different and way more detailed than what implementations such as java's ZipFile and friends does. The goal of this libray is to give the user unfettered read/write access to the binary layer of zip files. 
+
+This means that this implementation will return way more data than what you get from ZipFile and friends and will let you manipulate this data to your hearts content. This also means that this implementation will be able to (within reason) read meta data for corrupt zip files which other implementations might just give up with
 
 # What it is not
 This library was not written to extract files or data out of zip or jar files, there are other libraries (and ZipFile, ZipInputStream etc from java) out there for that. 
@@ -74,7 +76,7 @@ The main entry point to this library is the `zip-meta`:
                          :file-name "META-INF/MANIFEST.MF",
                          :extra-field #object["[B" 0x47cf4618 "[B@47cf4618"],
                          :file-comment ""}}
-               ...
+               ... <snip>
                ],
  :local-records [{:offset 0,
                   :record {:local-header-signature 67324752,
@@ -104,9 +106,12 @@ The main entry point to this library is the `zip-meta`:
                            :extra-field-length 0,
                            :file-name "META-INF/MANIFEST.MF",
                            :extra-field #object["[B" 0x1415a774 "[B@1415a774"]}}
+                ... <snip>
                 ]}
 => 
 ```
+(with some of the records omitted for brevity).
+
 There are also methods for fixing a preluded zip file and writing changes to the zip file meta data. I will try to document and polish these up some time soon. 
 
 # Why would you do this? 
