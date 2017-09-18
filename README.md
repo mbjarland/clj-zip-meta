@@ -1,6 +1,6 @@
 # What it is? 
 
-clj-zip-meta reads zip/jar files and returns the contained meta data (as defined by the [zip file specification](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT), as clojure data structures.
+clj-zip-meta reads zip/jar files and returns the contained meta data (as defined by the [zip file specification](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT) ), as clojure data structures.
 
 A zip/jar file has the general format: 
 
