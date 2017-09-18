@@ -149,19 +149,18 @@
       [extra-bytes actual-cdr-off {:offset actual-eo-off
                                    :record eo-cdr}])))
 
-(defn get-zip-meta [f]
+(defn zip-meta [f]
   (let [[extra-bytes cdr-offset eo-cdr] (read-end-of-cdr-record f)
         entries-total (:cdr-entries-total (:record eo-cdr))
         cdrs          (get-cdr-records f cdr-offset entries-total)
         locals        (get-local-records f (mapv :record cdrs) cdr-offset extra-bytes)]
     {:extra-bytes       extra-bytes
      :end-of-cdr-record eo-cdr
-     :cdr-record-count  entries-total
      :cdr-records       cdrs
      :local-records     locals}))
 
 (defn validate-zip-meta [f]
-  (let [meta   (get-zip-meta f)
+  (let [meta   (zip-meta f)
         eo-cdr (:end-of-cdr-record meta)
         locals (:local-records meta)
         cdrs   (:cdr-records meta)]
@@ -184,7 +183,7 @@
       (println "invalid local record signatures found"))))
 
 (defn update-zip-prelude-bytes [f]
-  (let [meta        (get-zip-meta f)
+  (let [meta        (zip-meta f)
         extra-bytes (:extra-bytes meta)
         g           (fn [off] (+ off extra-bytes))]
     (doseq [{offset :offset cdr :record} (:cdr-records meta)]
