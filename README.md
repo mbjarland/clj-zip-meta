@@ -32,8 +32,6 @@ A zip/jar file has the general internal format:
 
 This library reads the meta-data (local headers, central directory headers, and end of central directory record) as god and the zip file specification intended, by scanning from the end of the file for the end-of-central-directory record and locating the central directory based on the end-of-central-directory record. This is in contrast to a number of zip implementations out there which break if the zip file has extra bytes before the data (like self extracting zip files). 
 
-This is important as it allows you to for example create self executable jar files which you can run directly from the command line without requiring a `java -jar ...` call. 
-
 # Intent
 
 I wrote this library to solve a very specific problem:
