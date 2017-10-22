@@ -38,7 +38,7 @@ I wrote this library to solve a very specific problem:
  
 > make it possible to create executable clojure jar files (command line utilities) which do not require you to run `java -jar ` to execute them, but which are directly executable from the command line. 
 
-This can be accomplished by making the jar file itself executable (as in `chmod +x` or checking the executable flag on windows) and then prefixing the jar file binary data with your own code which essentially does `java -jar` on the file itself. This prepending with random data is supported by the zip file specification which means that after prefixing, the jar file is still valid in the eyes of java and all other ip file manipulating tools and you can also just execute it directly from the command line. 
+This can be accomplished by making the jar file itself executable (as in `chmod +x` or checking the executable flag on windows) and then prefixing the jar file binary data with your own code which essentially does `java -jar` on the file itself. This prepending with random data is supported by the zip file specification which means that after prefixing, the jar file is still valid in the eyes of java and all other zip file manipulating tools and you can also just execute it directly from the command line. 
 
 The problem is that just prepending bytes to the zip file without altering the zip file meta-data invalidates all the offsets in the zip meta and the offsets are now off by however many bytes the prepended snippet was. 
 
