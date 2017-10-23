@@ -1,6 +1,6 @@
 # What it is 
 
-clj-zip-meta reads zip (or jar) files and returns the contained meta-data (as defined by the [zip file specification](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT) ) as clojure data structures.
+clj-zip-meta reads zip (or jar) files and returns the contained meta-data (as defined by the [zip file specification](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT)) as clojure data structures.
 
 A zip/jar file has the general internal format: 
 
@@ -32,58 +32,11 @@ A zip/jar file has the general internal format:
 
 This library reads the meta-data (local headers, central directory headers, and end of central directory record) as god and the zip file specification intended, by scanning from the end of the file for the end-of-central-directory record and locating the central directory based on the end-of-central-directory record. This is in contrast to a number of zip implementations out there which break if the zip file has extra bytes before the data (like self extracting zip files). 
 
-# Intent
-
-I wrote this library to solve a very specific problem:
- 
-> make it possible to create executable clojure jar files (command line utilities) which do not require you to run `java -jar ` to execute them, but which are directly executable from the command line. 
-
-This can be accomplished by making the jar file itself executable (as in `chmod +x` or checking the executable flag on windows) and then prefixing the jar file binary data with your own code which essentially does `java -jar` on the file itself. This prepending with random data is supported by the zip file specification which means that after prefixing, the jar file is still valid in the eyes of java and all other zip file manipulating tools. 
-
-The problem is that just prepending bytes to the zip file without altering the zip file meta-data invalidates all the offsets in the zip meta and the offsets are now off by however many bytes the prepended snippet was. 
-
-This typically results in the following kind of messaging from say unzip: 
-
-```
-$ unzip -l bad_prelude.zip 
-
-Archive:  src/test/resources/bad_prelude.zip
-warning [src/test/resources/bad_prelude.zip]:  317 extra bytes at beginning or within zipfile
-  (attempting to process anyway)
-  Length      Date    Time    Name
----------  ---------- -----   ----
-...
-...
-$
-```
-
-in this case the zip file was still read since the unzip implementation does the sane thing. A lot of tools however give up at this point: 
-
-```
-$ zipdetails bad_prelude.zip 
-
-No Central Directory found
-
-$
-```
-
-This library allows you to update the zip meta offsets and regain zip file integrity after prepending a prelude script to the file. 
-
-To fix this, I needed a way to adjust all the zip internal offset values after prepending some data to a jar archive. This library is capable of doing just that. And since I already wrote most of the zip file parsing as defined by the specification to solve this problem, I figured I would make it available for others. 
-
-Note that the aim of this library is quite different and way more detailed than that of implementations such as java's ZipFile. The goal of this library is to give the user unfettered data oriented read/write access to the binary layer of zip files as defined by the zip file specification without abstracting away any of the details.   
-
-This also means that this implementation will be able to (within reason) read meta-data for corrupt zip files which other implementations might just give up with
 
 # What it is not
 This library was not written to extract files or data out of zip or jar files, there are other libraries (and ZipFile, ZipInputStream etc from java) out there for that. 
 
-# Status
-This library was just (September 2017) created and depends on a not-yet-released version (based on a [pull request](https://github.com/funcool/octet/pull/11) by me to support some features required by this project) of octet, a clojure binary format library. 
-
-The library can read zip meta-data, and for very specific needs, can update the meta-data as well. Robustness and/or completeness might or might not come in the future. 
-
-## Usage
+# Usage
 The main entry point to this library is the `zip-meta` function: 
 
 ```clojure
@@ -178,9 +131,58 @@ The main entry point to this library is the `zip-meta` function:
 ```
 (with some of the records omitted for brevity).
 
-The keys in the above map have a one-to-one correlation to the zip file specification. Please see the specification for details. 
+The keys in the above map have a one-to-one correspondence to the [zip file specification](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT). Please see the specification for details on the interpretation of the fields etc. 
 
 There are also methods for fixing a zip file with extra bytes prepended and writing changes to the zip file meta-data. I will try to document and polish these up some time soon. 
+
+
+# Intent
+
+I wrote this library to solve a very specific problem:
+ 
+> make it possible to create executable clojure jar files (command line utilities) which do not require you to run `java -jar ` to execute them, but which are directly executable from the command line. 
+
+This can be accomplished by making the jar file itself executable (as in `chmod +x` or checking the executable flag on windows) and then prefixing the jar file binary data with your own code which essentially does `java -jar` on the file itself. This prepending with random data is supported by the zip file specification which means that after prefixing, the jar file is still valid in the eyes of java and all other zip file manipulating tools. 
+
+The problem is that just prepending bytes to the zip file without altering the zip file meta-data invalidates all the offsets in the zip meta and the offsets are now off by however many bytes the prepended snippet was. 
+
+This typically results in the following kind of messaging from say unzip: 
+
+```
+$ unzip -l bad_prelude.zip 
+
+Archive:  src/test/resources/bad_prelude.zip
+warning [src/test/resources/bad_prelude.zip]:  317 extra bytes at beginning or within zipfile
+  (attempting to process anyway)
+  Length      Date    Time    Name
+---------  ---------- -----   ----
+...
+...
+$
+```
+
+in this case the zip file was still read since the unzip implementation does the sane thing. A lot of tools however give up at this point: 
+
+```
+$ zipdetails bad_prelude.zip 
+
+No Central Directory found
+
+$
+```
+
+This library allows you to update the zip meta offsets and regain zip file integrity after prepending a prelude script to the file. 
+
+Since I already wrote support for most of the zip file  specification to solve this problem, I figured I would make this code available for others. 
+
+Note that the aim of this library is quite different and way more detailed than that of implementations such as java's ZipFile. The goal of this library is to give the user unfettered data oriented read/write access to the binary layer of zip files as defined by the zip file specification without abstracting away any of the details.   
+
+This also means that this implementation will be able to (within reason) read meta-data for corrupt zip files which other implementations might just give up with
+
+# Status
+This code was just created and depends on a not-yet-released version (based on a [pull request](https://github.com/funcool/octet/pull/11) by me to support some features required by this project) of octet, a clojure binary format library. 
+
+The library was created to solve a specific problem as per the above, robustness and/or completeness might or might not come in the future. 
 
 # Why would you do this? 
 When I started looking at zip files in clojure I could not find a single library on the JVM (in clojure or otherwise) which actually reads the zip file meta-data. I'm not talking about reading entries like java's ZipFile etc, I'm talking about the actual binary format details of the zip specification. 
