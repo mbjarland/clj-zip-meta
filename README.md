@@ -36,7 +36,7 @@ This library reads the meta-data (local headers, central directory headers, and 
 This library was not written to extract files or data out of zip or jar files, there are other libraries (and ZipFile, ZipInputStream etc from java) out there for that. 
 
 # Latest Version
-The latest release version of Specter is hosted on [clojars](https://clojars.org/clj-cip-meta):
+The latest release version of clj-zip-meta is hosted on [clojars](https://clojars.org/clj-cip-meta):
 
 [![Current Version](https://clojars.org/clj-zip-meta/latest-version.svg)](https://clojars.org/clj-zip-meta)
 
