@@ -1,0 +1,9 @@
+<component name="libraryTable">
+  <library name="Leiningen: potemkin:0.4.2">
+    <CLASSES>
+      <root url="jar://$MAVEN_REPOSITORY$/potemkin/potemkin/0.4.2/potemkin-0.4.2.jar!/" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>
