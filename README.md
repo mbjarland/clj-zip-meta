@@ -1,4 +1,14 @@
-# What it is 
+Available via [clojars](https://clojars.org/clj-cip-meta)
+
+Stable version: 
+
+```clojure
+[clj-zip-meta "0.1.1"]
+```
+
+License: [EPL](http://www.eclipse.org/legal/epl-v10.html) (same as clojure)
+
+# About clj-zip-meta
 
 clj-zip-meta reads zip (or jar) files and returns the contained meta-data (as defined by the [zip file specification](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT)) as clojure data structures.
 
