@@ -1,14 +1,4 @@
-Available via [clojars](https://clojars.org/clj-cip-meta)
-
-Stable version: 
-
-```clojure
-[clj-zip-meta "0.1.1"]
-```
-
-License: [EPL](http://www.eclipse.org/legal/epl-v10.html) (same as clojure)
-
-# About clj-zip-meta
+# clj-zip-meta
 
 clj-zip-meta reads zip (or jar) files and returns the contained meta-data (as defined by the [zip file specification](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT)) as clojure data structures.
 
@@ -42,9 +32,13 @@ A zip/jar file has the general internal format:
 
 This library reads the meta-data (local headers, central directory headers, and end of central directory record) as god and the zip file specification intended, by scanning from the end of the file for the end-of-central-directory record and locating the central directory based on the end-of-central-directory record. This is in contrast to a number of zip implementations out there which break if the zip file has extra bytes before the data (like self extracting zip files). 
 
-
 # What it is not
 This library was not written to extract files or data out of zip or jar files, there are other libraries (and ZipFile, ZipInputStream etc from java) out there for that. 
+
+# Latest Version
+The latest release version of Specter is hosted on [clojars](https://clojars.org/clj-cip-meta):
+
+[![Current Version](https://clojars.org/clj-zip-meta/latest-version.svg)](https://clojars.org/clj-zip-meta)
 
 # Usage
 The main entry point to this library is the `zip-meta` function: 
