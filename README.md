@@ -180,9 +180,9 @@ Note that the aim of this library is quite different and way more detailed than 
 This also means that this implementation will be able to (within reason) read meta-data for corrupt zip files which other implementations might just give up with
 
 # Status
-This code was just created and depends on a not-yet-released version (based on a [pull request](https://github.com/funcool/octet/pull/11) by me to support some features required by this project) of octet, a clojure binary format library. 
+This code was just created in the fall of 2017 and at the time depended on a not-yet-released version of [octet](https://github.com/funcool/octet), a clojure libarary for dealing with binary formats. Since then my [pull request](https://github.com/funcool/octet/pull/11) to support a few features requied by this libarary has been accepted I am thus in a position to publish this to clojars. 
 
-The library was created to solve a specific problem as per the above, robustness and/or completeness might or might not come in the future. 
+This library was created to solve a specific problem as per the above, robustness and/or completeness might or might not come in the future. 
 
 # Why would you do this? 
 When I started looking at zip files in clojure I could not find a single library on the JVM (in clojure or otherwise) which actually reads the zip file meta-data. I'm not talking about reading entries like java's ZipFile etc, I'm talking about the actual binary format details of the zip specification. 
