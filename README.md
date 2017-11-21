@@ -1,4 +1,6 @@
 # clj-zip-meta
+[![License](https://img.shields.io/badge/License-EPL%201.0-green.svg)](https://opensource.org/licenses/EPL-1.0)
+[![Current Version](https://img.shields.io/clojars/v/clj-zip-meta.svg)](https://clojars.org/clj-zip-meta)
 
 clj-zip-meta reads zip (or jar) files and returns the contained meta-data (as defined by the [zip file specification](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT)) as clojure data structures.
 
