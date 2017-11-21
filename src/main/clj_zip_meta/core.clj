@@ -20,6 +20,7 @@
   (octet.util/bytes->hex sig-bytes))
 
 (defn raf [f ^String mode]
+  "utility function to create a RandomAccessFile"
   (if (instance? RandomAccessFile f)
     f
     (RandomAccessFile. ^File (jio/as-file f) mode)))
@@ -55,6 +56,13 @@
              (recur (+ offset step)))))))))
 
 (defn map-byte-buffer
+  "map a file or part of a file to a byte buffer. Mode should be
+  either the string r or the string rw. To map parts of the file,
+  use the offset and size parameters. Quoting the javadocs for
+  FileChannel:
+  A mapping, once established, is not dependent upon the file channel
+  that was used to create it. Closing the channel, in particular, has
+  no effect upon the validity of the mapping"
   ([f mode]
    (map-byte-buffer f mode 0))
 
@@ -71,15 +79,24 @@
                (.map c cm offset size))]
      (.order bb ByteOrder/LITTLE_ENDIAN))))
 
-(defn valid-offset? [off]
+(defn valid-offset?
+  "simple validation function for offsets"
+  [off]
   (not (or (nil? off) (neg? off))))
 
-(defn valid-signature? [f ^long offset ^long size ^bytes signature]
+(defn valid-signature?
+  "checks whether a file has a specific zip record signature
+  at a specific offset"
+  [f ^long offset ^long size ^bytes signature]
   (let [bb        (map-byte-buffer f "r" offset size)
         ^bytes ba (octet.buffer/read-bytes bb 0 size)]
     (java.util.Arrays/equals ba signature)))
 
-(defn find-end-of-cdr-offset [f]
+(defn find-end-of-cdr-offset
+  "given a file (or anything that jio/as-file will consume)
+  will find the end-of-cdr record offset by traversing the file
+  backwards starting from the end"
+  [f]
   (find-byte-pattern f (first (vals rec-end-of-cdr-sig)) -1 -1))
 
 (defn read-spec-from-buffer [buff spec off]
