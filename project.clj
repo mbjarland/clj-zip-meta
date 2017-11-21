@@ -1,4 +1,4 @@
-(defproject clj-zip-meta/clj-zip-meta "0.1.0"
+(defproject clj-zip-meta/clj-zip-meta "0.1.1"
   :description "a library for reading meta data from zip/jar files"
   :url "https://github.com/mbjarland/clj-zip-meta"
   :license {:name "Some Eclipse Public License"
