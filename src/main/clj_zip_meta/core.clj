@@ -182,7 +182,10 @@
             locals)
       (println "invalid local record signatures found"))))
 
-(defn update-zip-prelude-bytes [f]
+(defn repair-zip-with-preamble-bytes [f]
+  "repairs a zip file with 'extra bytes' at the beginning of the file
+  where the zip meta data offsets have not been updated to reflect the
+  extra bytes"
   (let [meta        (zip-meta f)
         extra-bytes (:extra-bytes meta)
         g           (fn [off] (+ off extra-bytes))]

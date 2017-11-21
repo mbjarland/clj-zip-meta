@@ -1,4 +1,4 @@
-(defproject clj-zip-meta "1.0"
+(defproject clj-zip-meta/clj-zip-meta "0.1.0"
   :description "a library for reading meta data from zip/jar files"
   :url "http://example.com/FIXME"
   :license {:name "Some Eclipse Public License"
