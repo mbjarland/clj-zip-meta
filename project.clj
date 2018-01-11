@@ -1,4 +1,4 @@
-(defproject clj-zip-meta/clj-zip-meta "0.1.1"
+(defproject clj-zip-meta/clj-zip-meta "0.1.2"
   :description "a library for reading meta data from zip/jar files"
   :url "https://github.com/mbjarland/clj-zip-meta"
   :license {:name "Some Eclipse Public License"
@@ -6,7 +6,7 @@
             :distribution :repo
             :comments "same as clojure"}
   :dependencies [[org.clojure/clojure "1.8.0"]
-                 [funcool/octet "1.0.2"]]
+                 [funcool/octet "1.1.0-SNAPSHOT"]]
   :source-paths ["src/main"]
   :resource-paths ["src/main/resources"]
   :test-paths ["src/test"]
