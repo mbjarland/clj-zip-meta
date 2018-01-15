@@ -7,100 +7,37 @@
 (def good-file "src/test/resources/good.zip")
 (def bad-prelude-file "src/test/resources/bad_prelude.zip")
 
-; example negative test
-; (fact "Should throw exception on empty layout string"
-;       (parse-layout-string "") => (throws AssertionError))
-
 (facts "should parse a valid zip file"
-       (let [meta (get-zip-meta good-file)]
+       (let [meta (zip-meta good-file)]
          (:extra-bytes meta) => 0))
 
 
 (facts "should parse a prelude zip file"
-       (let [meta (get-zip-meta bad-prelude-file)]
+       (let [meta (zip-meta bad-prelude-file)]
          (:extra-bytes meta) => 317))
 
-(comment
-  (tabular
-    (fact "long-date->ymd should parse valid dates"
-          (long-date->ymd ?date) => ?ymd)
-    ?date ?ymd
-    20160101 [2016 1 1]
-    20161111 [2016 11 11]
-    20161231 [2016 12 31]
-    20161111 [2016 11 11]
-    20100101 [2010 1 1])
+(facts "should parse good zip to valid signatures"
+       (let [meta (zip-meta good-file)]
+         (get-in meta [:end-of-cdr-record :record :end-of-cdr-signature]) => 101010256
+         (get-in meta [:cdr-records 0 :record :cdr-header-signature]) => 33639248
+         (get-in meta [:local-records 0 :record :local-header-signature]) => 67324752
+         ))
 
-  (tabular
-    (fact "date->ymd-str should parse valid dates"
-          (long-date->ymd-str ?date) => ?ymd-str)
-    ?date ?ymd-str
-    20160101 ["2016" "01" "01"]
-    20161111 ["2016" "11" "11"]
-    20161231 ["2016" "12" "31"]
-    20161111 ["2016" "11" "11"]
-    20100101 ["2010" "01" "01"])
+(facts "should parse good zip file to valid meta data"
+       (let [meta (zip-meta good-file)]
+         (:extra-bytes meta) => 0
+         (get-in meta [:end-of-cdr-record :offset]) => 563
 
-  (tabular
-    (fact "str-date->long-date should parse valid dates"
-          (str-date->long-date ?str-date) => ?date)
-    ?str-date ?date
-    "20160101" 20160101
-    "20161111" 20161111
-    "20161231" 20161231
-    "20161111" 20161111
-    "20100101" 20100101)
+         ; the offset in the eo-cdr should match
+         (get-in meta [:end-of-cdr-record :record :cdr-offset-from-start-disk]) => 309
+         (get-in meta [:cdr-records 0 :offset]) => 309
 
-  (tabular
-    (fact "long-date->local-date should work for valid dates"
-          (long-date->local-date ?date) => ?local-date)
-    ?date ?local-date
-    20160101 (local-date 2016 01 01)
-    20161111 (local-date 2016 11 11)
-    20161231 (local-date 2016 12 31)
-    20161111 (local-date 2016 11 11)
-    20100101 (local-date 2010 01 01))
+         (get-in meta [:end-of-cdr-record :record :cdr-entries-this-disk]) => 3
+         (get-in meta [:end-of-cdr-record :record :cdr-entries-total]) => 3
 
+         (count (:cdr-records meta)) => 3
+         (count (:local-records meta)) => 3
 
-  (tabular
-    (fact "local-date->long-date should work for valid dates"
-          (local-date->long-date ?local-date) => ?date)
-    ?local-date ?date
-    (local-date 2016 01 01) 20160101
-    (local-date 2016 11 11) 20161111
-    (local-date 2016 12 31) 20161231
-    (local-date 2016 11 11) 20161111
-    (local-date 2010 01 01) 20100101)
+         ))
 
-  (tabular
-    (fact "next-day should work for valid dates"
-          (next-day ?date) => ?expected-date)
-    ?date ?expected-date
-    20160101 20160102
-    20160228 20160229                                       ; leap year
-    20161111 20161112
-    20161231 20170101)
-
-  (tabular
-    (fact "prev-day should work for valid dates"
-          (prev-day ?date) => ?expected-date)
-    ?date ?expected-date
-    20160101 20151231
-    20160229 20160228
-    20161111 20161110
-    20161231 20161230)
-
-  (fact "day-seq should produce a valid date sequence for leap years"
-        (take 5 (day-seq 20160227)) => [20160227
-                                        20160228
-                                        20160229
-                                        20160301
-                                        20160302])
-
-  (fact "day-seq should produce a valid date sequence across year boundaries"
-        (take 5 (day-seq 20161228)) => [20161228
-                                        20161229
-                                        20161230
-                                        20161231
-                                        20170101])
-  )
+;; TODO: more tests 

@@ -1,5 +1,5 @@
 (ns clj-zip-meta.spec
-  (:require [octet.core :refer [spec int16 int32 ref-string* ref-bytes*]]))
+  (:require [octet.core :refer [spec int16 int32 ref-string ref-bytes]]))
 
 ; 4.3.7  Local file header:
 ;
@@ -30,8 +30,8 @@
     :uncompressed-size         int32
     :file-name-length          int16
     :extra-field-length        int16
-    :file-name                 (ref-string* :file-name-length)
-    :extra-field               (ref-bytes* :extra-field-length)))
+    :file-name                 (ref-string :file-name-length)
+    :extra-field               (ref-bytes :extra-field-length)))
 
 (def rec-local-file-header-sig
   {:cdr-header-signature (byte-array [0x50 0x4b 0x03 0x04])})
@@ -79,9 +79,9 @@
     :internal-file-attributes     int16
     :external-file-attributes     int32
     :relative-offset-local-header int32
-    :file-name                    (ref-string* :file-name-length)
-    :extra-field                  (ref-bytes*  :extra-field-length)
-    :file-comment                 (ref-string* :file-comment-length)))
+    :file-name                    (ref-string :file-name-length)
+    :extra-field                  (ref-bytes  :extra-field-length)
+    :file-comment                 (ref-string :file-comment-length)))
 (def rec-cdr-header-sig
   {:cdr-header-signature (byte-array [0x50 0x4b 0x01 0x02])})
 
@@ -113,6 +113,6 @@
     :cdr-size                   int32
     :cdr-offset-from-start-disk int32
     :zip-comment-length         int16
-    :zip-comment                (ref-string* :zip-comment-length)))
+    :zip-comment                (ref-string :zip-comment-length)))
 (def rec-end-of-cdr-sig
   {:end-of-cdr-signature (byte-array [0x50 0x4b 0x05 0x06])})
