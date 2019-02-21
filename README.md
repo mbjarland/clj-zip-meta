@@ -140,8 +140,10 @@ The main entry point to this library is the `zip-meta` function:
 
 The keys in the above map have a one-to-one correspondence to the [zip file specification](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT). Please see the specification for details on the interpretation of the fields etc. 
 
-There are also methods for fixing a zip file with extra bytes prepended and writing changes to the zip file meta-data. I will try to document and polish these up some time soon. 
+There are also methods for fixing a zip file with extra bytes prepended and writing changes to the zip file meta-data (`repair-zip-with-preamble-bytes`). I will try to document and polish these up some time soon. 
 
+# TODO
+The performance of the zip file parsing is not what it could be. Will look into this whenever I get a chance. 
 
 # Intent
 
@@ -196,6 +198,71 @@ When I started looking at zip files in clojure I could not find a single library
 
 This library solves that problem. In other words, given a zip file, this library will let you read and manipulate the zip end-of-cetral-directory record, all the central-directory records, and all the local records. See output in the Usage section for an example of how this data can look. 
 
+# Building Standalone Clojure Command Line Apps
+I have also published a leininingen template capable of creating clojure command line utilities. The template is published to clojars and is called `cli-cmd`. As I could not think of a better place to document `cli-cmd`, I'll stick some information here. 
+
+The following cli sequence:
+
+```
+~> lein new cli-cmd foo
+
+~> cd foo
+
+~> lein bin 
+Compiling foo.core
+Compiling foo.core
+Created /home/mbjarland/projects/clojure/foo/target/foo-0.1.0-SNAPSHOT.jar
+Created /home/mbjarland/projects/clojure/foo/target/foo-0.1.0-SNAPSHOT-standalone.jar
+Creating standalone executable: /projects/clojure/foo/target/foo
+Re-aligning zip offsets
+
+~> target/foo
+---- debug output, remove for production code ----
+options    {:port 80, :hostname "localhost", :verbosity 0}
+arguments  []
+errors     nil
+summary    
+   -p, --port PORT      80         Port number
+  -H, --hostname HOST  localhost  Remote host
+      --detach                    Detach from controlling process
+  -v                              Verbosity level; may be specified multiple times to increase value
+  -h, --help
+--------------------------------------------------
+This is my program. There are many like it, but this one is mine.
+
+Usage: foo [options] action
+
+Options:
+  -p, --port PORT      80         Port number
+  -H, --hostname HOST  localhost  Remote host
+      --detach                    Detach from controlling process
+  -v                              Verbosity level; may be specified multiple times to increase value
+  -h, --help
+
+Actions:
+  start    Start a new server
+  stop     Stop an existing server
+  status   Print a server's status
+
+Please refer to the manual page for more information.
+
+Error: invalid action '' specified!
+```
+
+will: 
+
+* create a new leiningen project `foo` for a new command line utility `foo`
+* build the new command line utility, thus creating an executable jar. 
+* call the newly built command line utility.
+
+Note that for the last point, no `java -jar x` is required as the call to java is built into the executable jar/zip file `foo`. 
+
+A few notes on projects created by the `cli-cmd` leiningen template: 
+
+* the created project uses the `lein-binplus` plugin capable of creating executable jar files. `lein-binplus` in turn uses this project.
+* the created project tries to set up a sane skeleton project with a reasonable example of cli parsing and self-documentation using `tools.cli`. The cli parsing is separated into its own namespace to leave the application code as clean as possible. 
+* the created project uses a jar preamble under `boot/jar-preamble.sh` which should work on but *nix and windows machines. The default preamble optionally uses the [drip](https://github.com/ninjudd/drip) jvm launch accelerator if drip is installed. This to make your clojure cli programs startup faster. 
+ 
 ## Author 
 Matias Bjarland - mbjarland@gmail.com - mbjarland on the clojure slack
 
