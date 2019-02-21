@@ -142,7 +142,7 @@ The keys in the above map have a one-to-one correspondence to the [zip file spec
 
 There are also methods for fixing a zip file with extra bytes prepended and writing changes to the zip file meta-data (`repair-zip-with-preamble-bytes`). I will try to document and polish these up some time soon. 
 
-# TODO
+# Improvements
 The performance of the zip file parsing is not what it could be. Will look into this whenever I get a chance. 
 
 # Intent
