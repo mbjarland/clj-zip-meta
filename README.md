@@ -198,7 +198,7 @@ When I started looking at zip files in clojure I could not find a single library
 
 This library solves that problem. In other words, given a zip file, this library will let you read and manipulate the zip end-of-cetral-directory record, all the central-directory records, and all the local records. See output in the Usage section for an example of how this data can look. 
 
-# Building Standalone Clojure Command Line Apps
+# Building Standalone Clojure CLI Tools
 I have also published a leininingen template capable of creating clojure command line utilities. The template is published to clojars and is called `cli-cmd`. As I could not think of a better place to document `cli-cmd`, I'll stick some information here. 
 
 The following cli sequence:
