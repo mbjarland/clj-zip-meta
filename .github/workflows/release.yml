@@ -49,6 +49,6 @@ jobs:
 
       - name: Deploy to Clojars
         env:
-          LEIN_USERNAME: ${{ secrets.CLOJARS_USERNAME }}
-          LEIN_PASSPHRASE: ${{ secrets.CLOJARS_PASSWORD }}
+          CLOJARS_USERNAME: ${{ secrets.CLOJARS_USERNAME }}
+          CLOJARS_PASSWORD: ${{ secrets.CLOJARS_PASSWORD }}
         run: lein deploy clojars

@@ -25,5 +25,11 @@
 
   :aliases {"test-all" ["with-profile" "+1.10:+1.11:+1.12" "test"]}
 
+  ;; Deploy credentials are read from the CLOJARS_USERNAME and
+  ;; CLOJARS_PASSWORD environment variables — the CI release workflow
+  ;; sets these from GitHub Secrets. Locally, drop them into
+  ;; ~/.lein/credentials.clj.gpg instead.
   :deploy-repositories [["clojars" {:url           "https://repo.clojars.org"
-                                    :sign-releases false}]])
+                                    :sign-releases false
+                                    :username      [:env/clojars_username]
+                                    :password      [:env/clojars_password]}]])
