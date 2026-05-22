@@ -171,12 +171,13 @@
 (deftest zip-meta-can-skip-local-records
   (let [full (zm/zip-meta good-file)
         cdr  (zm/zip-meta good-file {:include-locals false})
-        ;; CDR records are read separately on each call so the byte
-        ;; arrays in :extra-field are distinct objects even with
-        ;; identical content. Compare on the comparable primitive
-        ;; fields instead.
+        ;; Byte arrays inside the records (`:extra-field` and
+        ;; `:extra-fields[*].data`) are distinct objects on each
+        ;; read even when their contents match. Drop them before
+        ;; comparing.
         scrub (fn [recs]
-                (mapv #(update % :record dissoc :extra-field) recs))]
+                (mapv #(update % :record dissoc :extra-field :extra-fields)
+                      recs))]
     (is (contains? full :local-records))
     (is (not (contains? cdr :local-records)))
     (is (= (scrub (:cdr-records full)) (scrub (:cdr-records cdr))))
@@ -189,6 +190,41 @@
     (zm/set-zip-comment! tmp "hello, comment!")
     (is (= "hello, comment!" (zm/zip-comment tmp)))
     (is (true? (:valid? (zm/validate-zip-meta tmp))))))
+
+(deftest cdr-records-have-decoded-convenience-keys
+  (let [recs (->> (zm/zip-meta good-file) :cdr-records (mapv :record))
+        dir  (first (filter :directory? recs))
+        file (first (remove :directory? recs))]
+    (testing "every record has the decode-augmented keys"
+      (doseq [r recs]
+        (is (some? (:last-modified r)))
+        (is (set? (:dos-attributes r)))
+        (is (contains? r :unix-mode))
+        (is (contains? r :directory?))
+        (is (contains? r :encrypted?))
+        (is (contains? r :utf8-name?))
+        (is (vector? (:extra-fields r)))))
+    (testing "directory entry is recognised"
+      (is (true? (:directory? dir)))
+      (is (contains? (:dos-attributes dir) :directory)))
+    (testing "unix-mode decoded as expected octal"
+      (is (= 040755 (:unix-mode dir))) ; rwxr-xr-x directory
+      (is (= 0100644 (:unix-mode file))))
+    (testing "non-archive comment, non-encrypted, ASCII"
+      (is (false? (:encrypted? file)))
+      (is (false? (:utf8-name? file))))
+    (testing "extended-timestamp extra-field is decoded"
+      (let [ts (some #(when (= :extended-timestamp (:tag-name %)) %)
+                     (:extra-fields file))]
+        (is (some? ts))
+        (is (integer? (-> ts :decoded :mtime)))))))
+
+(deftest zip-meta-decode-false-skips-decoration
+  (let [r (first (:cdr-records (zm/zip-meta good-file {:decode false})))]
+    (is (not (contains? (:record r) :last-modified)))
+    (is (not (contains? (:record r) :dos-attributes)))
+    (is (not (contains? (:record r) :unix-mode)))
+    (is (not (contains? (:record r) :extra-fields)))))
 
 (deftest set-zip-comment-rejects-over-65535-bytes
   (let [tmp (copy-to-tmp good-file "comment-big-")]

@@ -33,6 +33,7 @@
            (java.nio ByteBuffer ByteOrder MappedByteBuffer)
            (java.nio.channels FileChannel FileChannel$MapMode)
            (java.nio.charset StandardCharsets)
+           (java.time LocalDateTime)
            (java.util Arrays)))
 
 (declare scan-backwards scan-forwards)
@@ -274,6 +275,166 @@
      (bit-and 0xFFFF (long (:file-name-length lfh)))
      (bit-and 0xFFFF (long (:extra-field-length lfh)))))
 
+;; ----------------------------------------------------------------------------
+;; Decoded convenience fields
+;;
+;; The raw record fields preserve the on-disk bit pattern verbatim
+;; (so writes can round-trip cleanly). These helpers layer
+;; higher-level interpretations on top:
+;;
+;;   :last-modified      java.time.LocalDateTime decoded from
+;;                       :last-mod-file-time + :last-mod-file-date
+;;   :dos-attributes     set of keywords decoded from the low byte of
+;;                       :external-file-attributes (CDR) — :read-only
+;;                       :hidden :system :volume :directory :archive
+;;   :unix-mode          Unix file mode from the high 16 bits of
+;;                       :external-file-attributes when version-made-by
+;;                       reports Unix (host code 3); nil otherwise.
+;;   :directory?         convenience boolean (file name ends with "/" or
+;;                       DOS directory bit is set)
+;;   :encrypted?         general-purpose bit 0
+;;   :utf8-name?         general-purpose bit 11
+;;   :extra-fields       parsed list of TLVs from :extra-field
+;;                       (each {:tag T :data bytes [+ decoded keys]}).
+
+(defn- ^LocalDateTime dos->ldt [^long dos-date ^long dos-time]
+  (let [year   (+ 1980 (bit-and 0x7F (unsigned-bit-shift-right dos-date 9)))
+        month  (bit-and 0x0F (unsigned-bit-shift-right dos-date 5))
+        day    (bit-and 0x1F dos-date)
+        hour   (bit-and 0x1F (unsigned-bit-shift-right dos-time 11))
+        minute (bit-and 0x3F (unsigned-bit-shift-right dos-time 5))
+        second (* 2 (bit-and 0x1F dos-time))]
+    (when (and (<= 1 month 12) (<= 1 day 31)
+               (<= 0 hour 23) (<= 0 minute 59) (<= 0 second 59))
+      (try (LocalDateTime/of (int year) (int month) (int day)
+                             (int hour) (int minute) (int second))
+           (catch Exception _ nil)))))
+
+(def ^:private dos-attr-bits
+  [[0x01 :read-only]
+   [0x02 :hidden]
+   [0x04 :system]
+   [0x08 :volume]
+   [0x10 :directory]
+   [0x20 :archive]])
+
+(defn- dos-attrs [^long external-file-attributes]
+  (let [low (bit-and 0xFF external-file-attributes)]
+    (persistent!
+      (reduce
+        (fn [acc [bit kw]]
+          (if (pos? (bit-and bit low)) (conj! acc kw) acc))
+        (transient #{})
+        dos-attr-bits))))
+
+(defn- unix-mode-from
+  "Decode the Unix mode from `:external-file-attributes` when
+  version-made-by's host byte is Unix (3). The mode lives in the
+  high 16 bits (bits 16..31 after a shift)."
+  [^long version-made-by ^long external-file-attributes]
+  (when (= 3 (bit-and 0xFF (unsigned-bit-shift-right version-made-by 8)))
+    (bit-and 0xFFFF (unsigned-bit-shift-right external-file-attributes 16))))
+
+(def ^:private extra-tags
+  {0x0001 :zip64
+   0x000A :ntfs
+   0x000D :pkware-unix
+   0x5455 :extended-timestamp
+   0x5855 :infozip-unix-old
+   0x7855 :infozip-unix-new
+   0x6375 :infozip-utf8-comment
+   0x7075 :infozip-utf8-path
+   0x9901 :aes})
+
+(defn- read-bytes-from
+  [^bytes ba ^long off ^long len]
+  (let [out (byte-array (int len))]
+    (System/arraycopy ba (int off) out 0 (int len))
+    out))
+
+(defn- decode-extended-timestamp
+  "Bit 0: mtime, bit 1: atime, bit 2: ctime; each present time is a
+  signed 32-bit Unix timestamp following the flag byte."
+  [^bytes data]
+  (try
+    (when (pos? (alength data))
+      (let [bb    (-> (ByteBuffer/wrap data) (.order ByteOrder/LITTLE_ENDIAN))
+            flags (bit-and 0xFF (long (.get bb 0)))
+            out   (transient {:flags flags})]
+        (loop [pos 1
+               kws [[0x01 :mtime] [0x02 :atime] [0x04 :ctime]]]
+          (if (or (empty? kws) (> (+ pos 4) (alength data)))
+            (persistent! out)
+            (let [[bit kw] (first kws)]
+              (if (pos? (bit-and bit flags))
+                (do (assoc! out kw (.getInt bb (int pos)))
+                    (recur (+ pos 4) (rest kws)))
+                (recur pos (rest kws))))))))
+    (catch Exception _ nil)))
+
+(defn- decode-extra-field [tag ^bytes data]
+  (case tag
+    :extended-timestamp (decode-extended-timestamp data)
+    nil))
+
+(defn- parse-extra-fields
+  "Parse the byte array `ba` as a sequence of zip extra-field TLV
+  records. Returns a vector of `{:tag T :tag-name K :size N :data bytes}`
+  maps, where `:tag-name` is a known keyword (or nil) and `:decoded`
+  appears when the tag has a decoder."
+  [^bytes ba]
+  (let [len (alength ba)]
+    (loop [pos 0
+           acc (transient [])]
+      (if (> (+ pos 4) len)
+        (persistent! acc)
+        (let [bb     (-> (ByteBuffer/wrap ba) (.order ByteOrder/LITTLE_ENDIAN))
+              tag-i  (bit-and 0xFFFF (long (.getShort bb (int pos))))
+              size   (bit-and 0xFFFF (long (.getShort bb (int (+ pos 2)))))
+              end    (+ pos 4 size)]
+          (if (> end len)
+            (persistent! acc)
+            (let [data    (read-bytes-from ba (+ pos 4) size)
+                  tag-kw  (get extra-tags tag-i)
+                  base    {:tag tag-i :tag-name tag-kw :size size :data data}
+                  decoded (when tag-kw (decode-extra-field tag-kw data))]
+              (recur end
+                     (conj! acc (cond-> base
+                                  decoded (assoc :decoded decoded)))))))))))
+
+(defn- decorate-cdr
+  "Add decoded convenience keys to a raw CDR record."
+  [cdr]
+  (let [gp     (long (:general-purpose cdr))
+        eattr  (long (:external-file-attributes cdr))
+        vmade  (long (:version-made-by cdr))
+        name   (:file-name cdr)
+        dattrs (dos-attrs eattr)]
+    (assoc cdr
+      :last-modified    (dos->ldt (long (:last-mod-file-date cdr))
+                                  (long (:last-mod-file-time cdr)))
+      :dos-attributes   dattrs
+      :unix-mode        (unix-mode-from vmade eattr)
+      :directory?       (or (contains? dattrs :directory)
+                            (and (string? name) (str/ends-with? name "/")))
+      :encrypted?       (pos? (bit-and gp 0x0001))
+      :utf8-name?       (pos? (bit-and gp 0x0800))
+      :extra-fields     (parse-extra-fields (:extra-field cdr)))))
+
+(defn- decorate-lfh
+  "Add decoded convenience keys to a raw LFH record (no
+  :external-file-attributes here)."
+  [lfh]
+  (let [gp   (long (:general-purpose lfh))
+        name (:file-name lfh)]
+    (assoc lfh
+      :last-modified  (dos->ldt (long (:last-mod-file-date lfh))
+                                (long (:last-mod-file-time lfh)))
+      :directory?     (and (string? name) (str/ends-with? name "/"))
+      :encrypted?     (pos? (bit-and gp 0x0001))
+      :utf8-name?     (pos? (bit-and gp 0x0800))
+      :extra-fields   (parse-extra-fields (:extra-field lfh)))))
+
 ;; ============================================================================
 ;; Public low-level API
 
@@ -410,14 +571,15 @@
 (defn- read-cdr-records*
   "Read `entries` consecutive CDR records from `bb` starting at byte
   position `start-off`. Returns a vector of `{:offset N :record M}`."
-  [^ByteBuffer bb ^long start-off ^long entries]
+  [^ByteBuffer bb ^long start-off ^long entries decode?]
   (loop [acc (transient [])
          off start-off
          n   entries]
     (if (zero? n)
       (persistent! acc)
-      (let [record (read-cdr! bb off)
-            sz     (cdr-size* record)]
+      (let [raw    (read-cdr! bb off)
+            sz     (cdr-size* raw)
+            record (if decode? (decorate-cdr raw) raw)]
         (recur (conj! acc {:offset off :record record})
                (+ off sz)
                (dec n))))))
@@ -427,32 +589,38 @@
   buffer that covers the start of the file at least through the
   beginning of the central directory. `extra-bytes` is added to each
   recorded `:relative-offset-local-header`."
-  [^ByteBuffer bb cdr-records ^long extra-bytes]
+  [^ByteBuffer bb cdr-records ^long extra-bytes decode?]
   (mapv
     (fn [cdr]
-      (let [off    (+ (long (:relative-offset-local-header cdr)) extra-bytes)
-            record (read-lfh! bb off)]
-        {:offset off :record record}))
+      (let [off (+ (long (:relative-offset-local-header cdr)) extra-bytes)
+            raw (read-lfh! bb off)]
+        {:offset off
+         :record (if decode? (decorate-lfh raw) raw)}))
     cdr-records))
 
 (defn get-cdr-records
   "Read `entries` central directory records from file `f` starting at
-  byte offset `off`. Returns a vector of `{:offset N :record M}`."
+  byte offset `off`. Returns a vector of `{:offset N :record M}`.
+  Records include the decoded convenience keys
+  (`:last-modified`, `:dos-attributes`, `:unix-mode`, `:directory?`,
+  `:encrypted?`, `:utf8-name?`, `:extra-fields`)."
   [f off entries]
   {:pre [(valid-offset? off)]}
   (with-raf [r f "r"]
     (let [bb (map-region r "r" 0 (.length r))]
-      (read-cdr-records* bb (long off) (long entries)))))
+      (read-cdr-records* bb (long off) (long entries) true))))
 
 (defn get-local-records
   "Read the local file headers referenced by `cdr-records` from file
   `f`. `cdr-offset` is the central-directory start offset (used as a
   buffer-mapping upper bound). `extra-bytes` is added to each
-  `:relative-offset-local-header` value."
+  `:relative-offset-local-header` value. Records include the decoded
+  convenience keys (`:last-modified`, `:directory?`, `:encrypted?`,
+  `:utf8-name?`, `:extra-fields`)."
   [f cdr-records cdr-offset extra-bytes]
   (with-raf [r f "r"]
     (let [bb (map-region r "r" 0 (long cdr-offset))]
-      (read-local-records* bb cdr-records (long extra-bytes)))))
+      (read-local-records* bb cdr-records (long extra-bytes) true))))
 
 (defn read-end-of-cdr-record
   "Find and read the end-of-central-directory record from `f`.
@@ -509,14 +677,21 @@
   when only the central directory is needed.
 
   Each `:record` map mirrors the corresponding zip-specification
-  record (see `clj-zip-meta.spec` and APPNOTE.TXT §4.3). Throws
-  `ex-info` if the archive is malformed.
+  record (see `clj-zip-meta.spec` and APPNOTE.TXT §4.3) and is
+  augmented with decoded convenience keys: `:last-modified`
+  (LocalDateTime), `:directory?`, `:encrypted?`, `:utf8-name?`,
+  `:extra-fields` (parsed TLV vector), and on CDR entries
+  `:dos-attributes` (set) and `:unix-mode` (octal). Pass
+  `{:decode false}` to skip decoration and get the raw fields only.
+
+  Throws `ex-info` if the archive is malformed.
 
   Performance note: this function memory-maps the file once and reads
   every record from a single mapping; the channel is released as the
   function returns."
   ([f] (zip-meta f {}))
-  ([f {:keys [include-locals] :or {include-locals true}}]
+  ([f {:keys [include-locals decode]
+       :or   {include-locals true decode true}}]
    (with-raf [r f "r"]
      (let [len            (.length r)
            eocdr-off      (or (find-end-of-cdr-offset r)
@@ -542,13 +717,14 @@
                                                  :expected-cdr-off cdr-off-actual
                                                  :extra-bytes      extra-bytes}))))
            entries        (long (:cdr-entries-total eocdr-rec))
-           cdrs           (read-cdr-records* file-bb cdr-off-actual entries)
+           cdrs           (read-cdr-records* file-bb cdr-off-actual entries (boolean decode))
            base           {:extra-bytes       extra-bytes
                            :end-of-cdr-record {:offset eocdr-off :record eocdr-rec}
                            :cdr-records       cdrs}]
        (if include-locals
          (assoc base :local-records
-                (read-local-records* file-bb (mapv :record cdrs) extra-bytes))
+                (read-local-records* file-bb (mapv :record cdrs)
+                                     extra-bytes (boolean decode)))
          base)))))
 
 ;; ============================================================================
