@@ -277,6 +277,64 @@
      (bit-and 0xFFFF (long (:extra-field-length lfh)))))
 
 ;; ----------------------------------------------------------------------------
+;; Hand-rolled writers (mirroring the readers above).
+;;
+;; Octet handles writes correctly but at the same per-field protocol-
+;; dispatch cost as reads. These writers operate directly on a
+;; little-endian ByteBuffer. Each returns the total number of bytes
+;; written. The public octet-based write-spec-to-* functions are kept
+;; for backwards compatibility.
+
+(defn- write-eocdr! ^long [^ByteBuffer bb ^long pos eocdr]
+  (let [cmt  (str (or (:zip-comment eocdr) ""))
+        cbs  (.getBytes cmt "UTF-8")
+        clen (alength cbs)]
+    (.putInt   bb (int pos)        (unchecked-int   (long (:end-of-cdr-signature       eocdr))))
+    (.putShort bb (int (+ pos 4))  (unchecked-short (long (:number-of-this-disk        eocdr))))
+    (.putShort bb (int (+ pos 6))  (unchecked-short (long (:number-of-cdr-disk         eocdr))))
+    (.putShort bb (int (+ pos 8))  (unchecked-short (long (:cdr-entries-this-disk      eocdr))))
+    (.putShort bb (int (+ pos 10)) (unchecked-short (long (:cdr-entries-total          eocdr))))
+    (.putInt   bb (int (+ pos 12)) (unchecked-int   (long (:cdr-size                   eocdr))))
+    (.putInt   bb (int (+ pos 16)) (unchecked-int   (long (:cdr-offset-from-start-disk eocdr))))
+    (.putShort bb (int (+ pos 20)) (unchecked-short (long clen)))
+    (when (pos? clen)
+      (.position bb (int (+ pos 22)))
+      (.put bb cbs))
+    (+ 22 clen)))
+
+(defn- write-cdr! ^long [^ByteBuffer bb ^long pos cdr]
+  (let [nm   (str (or (:file-name    cdr) ""))
+        cmt  (str (or (:file-comment cdr) ""))
+        ex   (or  (:extra-field cdr) (byte-array 0))
+        nbs  (.getBytes nm "UTF-8")
+        cbs  (.getBytes cmt "UTF-8")
+        nlen (alength nbs)
+        elen (alength ^bytes ex)
+        clen (alength cbs)]
+    (.putInt   bb (int pos)        (unchecked-int   (long (:cdr-header-signature         cdr))))
+    (.putShort bb (int (+ pos 4))  (unchecked-short (long (:version-made-by              cdr))))
+    (.putShort bb (int (+ pos 6))  (unchecked-short (long (:version-needed-to-extract    cdr))))
+    (.putShort bb (int (+ pos 8))  (unchecked-short (long (:general-purpose              cdr))))
+    (.putShort bb (int (+ pos 10)) (unchecked-short (long (:compression-method           cdr))))
+    (.putShort bb (int (+ pos 12)) (unchecked-short (long (:last-mod-file-time           cdr))))
+    (.putShort bb (int (+ pos 14)) (unchecked-short (long (:last-mod-file-date           cdr))))
+    (.putInt   bb (int (+ pos 16)) (unchecked-int   (long (:crc-32                       cdr))))
+    (.putInt   bb (int (+ pos 20)) (unchecked-int   (long (:compressed-size              cdr))))
+    (.putInt   bb (int (+ pos 24)) (unchecked-int   (long (:uncompressed-size            cdr))))
+    (.putShort bb (int (+ pos 28)) (unchecked-short (long nlen)))
+    (.putShort bb (int (+ pos 30)) (unchecked-short (long elen)))
+    (.putShort bb (int (+ pos 32)) (unchecked-short (long clen)))
+    (.putShort bb (int (+ pos 34)) (unchecked-short (long (:disk-number-start            cdr))))
+    (.putShort bb (int (+ pos 36)) (unchecked-short (long (:internal-file-attributes     cdr))))
+    (.putInt   bb (int (+ pos 38)) (unchecked-int   (long (:external-file-attributes     cdr))))
+    (.putInt   bb (int (+ pos 42)) (unchecked-int   (long (:relative-offset-local-header cdr))))
+    (.position bb (int (+ pos 46)))
+    (when (pos? nlen) (.put bb nbs))
+    (when (pos? elen) (.put bb ^bytes ex))
+    (when (pos? clen) (.put bb cbs))
+    (+ 46 nlen elen clen)))
+
+;; ----------------------------------------------------------------------------
 ;; Decoded convenience fields
 ;;
 ;; The raw record fields preserve the on-disk bit pattern verbatim
@@ -749,13 +807,11 @@
         (let [len (.length r)
               bb  (map-region r "rw" 0 len)]
           (doseq [{offset :offset cdr :record} (:cdr-records meta)]
-            (write-spec-bb! bb
-                            (update cdr :relative-offset-local-header + extra-bytes)
-                            rec-cdr-header offset))
+            (write-cdr! bb offset
+                        (update cdr :relative-offset-local-header + extra-bytes)))
           (let [{eo-off :offset eo :record} (:end-of-cdr-record meta)]
-            (write-spec-bb! bb
-                            (update eo :cdr-offset-from-start-disk + extra-bytes)
-                            rec-end-of-cdr eo-off))
+            (write-eocdr! bb eo-off
+                          (update eo :cdr-offset-from-start-disk + extra-bytes)))
           (.force ^MappedByteBuffer bb))))
     f))
 
@@ -1057,9 +1113,9 @@
                             base)))
                       locals)
          cdr-start (long (:end-offset (last locals)))
-         cdr-size  (reduce + 0 (map #(long (ospec/size* rec-cdr-header %)) cdrs))
+         cdr-size  (reduce + 0 (map cdr-size* cdrs))
          eocdr     (mk-eocdr cdrs (- cdr-start extra) cdr-size zip-comment)
-         eocdr-size (long (ospec/size* rec-end-of-cdr eocdr))
+         eocdr-size (+ 22 (alength (.getBytes ^String zip-comment "UTF-8")))
          total     (+ cdr-start cdr-size eocdr-size)]
      (with-raf [r f "rw"]
        (.setLength r total)
@@ -1067,10 +1123,10 @@
          (loop [pos cdr-start
                 rs  cdrs]
            (when-let [rec (first rs)]
-             (write-spec-bb! bb rec rec-cdr-header pos)
-             (recur (+ pos (long (ospec/size* rec-cdr-header rec)))
+             (write-cdr! bb pos rec)
+             (recur (+ pos (cdr-size* rec))
                     (rest rs))))
-         (write-spec-bb! bb eocdr rec-end-of-cdr (+ cdr-start cdr-size))
+         (write-eocdr! bb (+ cdr-start cdr-size) eocdr)
          (.force ^MappedByteBuffer bb)))
      f)))
 
@@ -1342,16 +1398,16 @@
     (when (> (alength cbytes) 0xFFFF)
       (throw (ex-info "zip comment exceeds the 65 535-byte maximum"
                       {:length (alength cbytes)})))
-    (let [m       (zip-meta f {:include-locals false})
+    (let [m       (zip-meta f {:include-locals false :decode false})
           {eo-off :offset eo :record} (:end-of-cdr-record m)
           new-eo  (assoc eo :zip-comment comment
                            :zip-comment-length (alength cbytes))
-          new-eo-size (long (ospec/size* rec-end-of-cdr new-eo))
+          new-eo-size (+ 22 (alength cbytes))
           new-len     (+ (long eo-off) new-eo-size)]
       (with-raf [r f "rw"]
         (.setLength r new-len)
         (let [^ByteBuffer bb (map-region r "rw" 0 new-len)]
-          (write-spec-bb! bb new-eo rec-end-of-cdr eo-off)
+          (write-eocdr! bb eo-off new-eo)
           (.force ^MappedByteBuffer bb))))
     f))
 
