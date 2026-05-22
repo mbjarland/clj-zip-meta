@@ -31,5 +31,5 @@
   ;; ~/.lein/credentials.clj.gpg instead.
   :deploy-repositories [["clojars" {:url           "https://repo.clojars.org"
                                     :sign-releases false
-                                    :username      [:env/clojars_username]
-                                    :password      [:env/clojars_password]}]])
+                                    :username      :env/clojars_username
+                                    :password      :env/clojars_password}]])
