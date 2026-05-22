@@ -14,6 +14,7 @@
   :source-paths   ["src/main"]
   :resource-paths ["src/main/resources"]
   :test-paths     ["src/test"]
+  :main           clj-zip-meta.cli
 
   :profiles {:dev      {:resource-paths ["src/test/resources"]
                         :global-vars    {*warn-on-reflection* true}}

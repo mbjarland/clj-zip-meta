@@ -168,6 +168,33 @@
   (is (= "50 4b 05 06" (zm/dump-sig-number 0x06054b50)))
   (is (= "50 4b 05 06" (zm/dump-sig-bytes (byte-array [0x50 0x4b 0x05 0x06])))))
 
+(deftest zip-meta-can-skip-local-records
+  (let [full (zm/zip-meta good-file)
+        cdr  (zm/zip-meta good-file {:include-locals false})
+        ;; CDR records are read separately on each call so the byte
+        ;; arrays in :extra-field are distinct objects even with
+        ;; identical content. Compare on the comparable primitive
+        ;; fields instead.
+        scrub (fn [recs]
+                (mapv #(update % :record dissoc :extra-field) recs))]
+    (is (contains? full :local-records))
+    (is (not (contains? cdr :local-records)))
+    (is (= (scrub (:cdr-records full)) (scrub (:cdr-records cdr))))
+    (is (= (get-in full [:end-of-cdr-record :record :end-of-cdr-signature])
+           (get-in cdr  [:end-of-cdr-record :record :end-of-cdr-signature])))
+    (is (= (count (:cdr-records full)) (count (:cdr-records cdr))))))
+
+(deftest set-zip-comment-round-trip
+  (let [tmp (copy-to-tmp good-file "comment-")]
+    (zm/set-zip-comment! tmp "hello, comment!")
+    (is (= "hello, comment!" (zm/zip-comment tmp)))
+    (is (true? (:valid? (zm/validate-zip-meta tmp))))))
+
+(deftest set-zip-comment-rejects-over-65535-bytes
+  (let [tmp (copy-to-tmp good-file "comment-big-")]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"65 535"
+                          (zm/set-zip-comment! tmp (apply str (repeat 65536 "x")))))))
+
 ;; ---------------------------------------------------------------------------
 ;; deep repair: rebuild CDR from local headers
 
@@ -189,6 +216,11 @@
   [^String path ^long new-length]
   (with-open [r (RandomAccessFile. path "rw")]
     (.setLength r new-length)))
+
+(deftest find-entry-by-name
+  (let [path (write-test-zip {"alpha.txt" "a" "beta.txt" "b" "gamma.txt" "g"})]
+    (is (= "beta.txt" (:file-name (zm/find-entry path "beta.txt"))))
+    (is (nil? (zm/find-entry path "nope.txt")))))
 
 (deftest creates-and-parses-a-test-zip
   (let [path (write-test-zip {"a.txt" "alpha" "b.txt" "bravo"})

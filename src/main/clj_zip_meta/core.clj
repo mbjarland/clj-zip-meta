@@ -358,8 +358,11 @@
       [extra-bytes cdr-off-actual {:offset eocdr-off :record eocdr-rec}])))
 
 (defn zip-meta
-  "Read all zip metadata from `f` (a path `String`, a `java.io.File`,
-  or an open `RandomAccessFile`). Returns a map with keys:
+  "Read zip metadata from `f` (a path `String`, a `java.io.File`, or
+  an open `RandomAccessFile`).
+
+  With one argument or `{:include-locals true}` (the default) returns
+  a map with keys:
 
     `:extra-bytes`       — number of bytes prepended before the zip
                             payload (0 for a well-formed archive)
@@ -369,45 +372,52 @@
     `:local-records`     — vector of `{:offset N :record M}` local
                             file headers
 
+  With `{:include-locals false}` the `:local-records` key is omitted;
+  for archives with many entries this can be significantly faster
+  when only the central directory is needed.
+
   Each `:record` map mirrors the corresponding zip-specification
   record (see `clj-zip-meta.spec` and APPNOTE.TXT §4.3). Throws
   `ex-info` if the archive is malformed.
 
-  Performance note: this function memory-maps the file once and
-  reads every record from a single mapping, then releases the
-  channel."
-  [f]
-  (with-raf [r f "r"]
-    (let [len            (.length r)
-          eocdr-off      (or (find-end-of-cdr-offset r)
-                             (throw (ex-info "End-of-central-directory record not found"
-                                             {:file (str f) :length len})))
-          ^ByteBuffer
-          file-bb        (map-region r "r" 0 len)
-          eocdr-rec      (read-spec-bb file-bb rec-end-of-cdr eocdr-off)
-          cdr-recorded   (+ (long (:cdr-offset-from-start-disk eocdr-rec))
-                            (long (:cdr-size eocdr-rec)))
-          extra-bytes    (- eocdr-off cdr-recorded)
-          cdr-off-actual (+ (long (:cdr-offset-from-start-disk eocdr-rec))
-                            extra-bytes)
-          sig            (sig-bytes rec-cdr-header-sig)
-          siglen         (alength ^bytes sig)
-          sig-ba         (byte-array siglen)
-          _              (do (.position file-bb (int cdr-off-actual))
-                             (.get file-bb sig-ba)
-                             (when-not (Arrays/equals ^bytes sig-ba ^bytes sig)
-                               (throw (ex-info "Central directory signature not found at expected offset"
-                                               {:file             (str f)
-                                                :eocdr-offset     eocdr-off
-                                                :expected-cdr-off cdr-off-actual
-                                                :extra-bytes      extra-bytes}))))
-          entries        (long (:cdr-entries-total eocdr-rec))
-          cdrs           (read-cdr-records* file-bb cdr-off-actual entries)
-          locals         (read-local-records* file-bb (mapv :record cdrs) extra-bytes)]
-      {:extra-bytes       extra-bytes
-       :end-of-cdr-record {:offset eocdr-off :record eocdr-rec}
-       :cdr-records       cdrs
-       :local-records     locals})))
+  Performance note: this function memory-maps the file once and reads
+  every record from a single mapping; the channel is released as the
+  function returns."
+  ([f] (zip-meta f {}))
+  ([f {:keys [include-locals] :or {include-locals true}}]
+   (with-raf [r f "r"]
+     (let [len            (.length r)
+           eocdr-off      (or (find-end-of-cdr-offset r)
+                              (throw (ex-info "End-of-central-directory record not found"
+                                              {:file (str f) :length len})))
+           ^ByteBuffer
+           file-bb        (map-region r "r" 0 len)
+           eocdr-rec      (read-spec-bb file-bb rec-end-of-cdr eocdr-off)
+           cdr-recorded   (+ (long (:cdr-offset-from-start-disk eocdr-rec))
+                             (long (:cdr-size eocdr-rec)))
+           extra-bytes    (- eocdr-off cdr-recorded)
+           cdr-off-actual (+ (long (:cdr-offset-from-start-disk eocdr-rec))
+                             extra-bytes)
+           sig            (sig-bytes rec-cdr-header-sig)
+           siglen         (alength ^bytes sig)
+           sig-ba         (byte-array siglen)
+           _              (do (.position file-bb (int cdr-off-actual))
+                              (.get file-bb sig-ba)
+                              (when-not (Arrays/equals ^bytes sig-ba ^bytes sig)
+                                (throw (ex-info "Central directory signature not found at expected offset"
+                                                {:file             (str f)
+                                                 :eocdr-offset     eocdr-off
+                                                 :expected-cdr-off cdr-off-actual
+                                                 :extra-bytes      extra-bytes}))))
+           entries        (long (:cdr-entries-total eocdr-rec))
+           cdrs           (read-cdr-records* file-bb cdr-off-actual entries)
+           base           {:extra-bytes       extra-bytes
+                           :end-of-cdr-record {:offset eocdr-off :record eocdr-rec}
+                           :cdr-records       cdrs}]
+       (if include-locals
+         (assoc base :local-records
+                (read-local-records* file-bb (mapv :record cdrs) extra-bytes))
+         base)))))
 
 ;; ============================================================================
 ;; Validation and repair
@@ -853,7 +863,10 @@
     `:uncompressed-size`   — uncompressed size in bytes
     `:crc-32`              — CRC-32 of the uncompressed data
     `:compression-method`  — 0 = stored, 8 = deflate, etc.
-    `:offset`              — file offset of the CDR record"
+    `:offset`              — file offset of the CDR record
+
+  Reads only the central directory — much faster than `zip-meta` for
+  archives with many entries when local file headers are not needed."
   [f]
   (mapv
     (fn [{offset :offset cdr :record}]
@@ -864,13 +877,44 @@
        :crc-32             (:crc-32 cdr)
        :compression-method (:compression-method cdr)
        :offset             offset})
-    (:cdr-records (zip-meta f))))
+    (:cdr-records (zip-meta f {:include-locals false}))))
+
+(defn find-entry
+  "Find the entry whose `:file-name` equals `file-name`. Returns the
+  compact summary map (see `zip-entries`) or `nil` if not found."
+  [f file-name]
+  (some #(when (= (:file-name %) file-name) %) (zip-entries f)))
 
 (defn zip-comment
   "Return the archive-level comment from `f` (an empty string if
   none)."
   [f]
-  (get-in (zip-meta f) [:end-of-cdr-record :record :zip-comment]))
+  (get-in (zip-meta f {:include-locals false})
+          [:end-of-cdr-record :record :zip-comment]))
+
+(defn set-zip-comment!
+  "Replace the archive-level comment in `f` with `comment` (encoded
+  UTF-8). The file is resized if the new comment is a different
+  length than the old one. Returns `f`.
+
+  Note: the zip specification limits the comment to 65 535 bytes."
+  [f ^String comment]
+  (let [cbytes  (.getBytes comment "UTF-8")]
+    (when (> (alength cbytes) 0xFFFF)
+      (throw (ex-info "zip comment exceeds the 65 535-byte maximum"
+                      {:length (alength cbytes)})))
+    (let [m       (zip-meta f {:include-locals false})
+          {eo-off :offset eo :record} (:end-of-cdr-record m)
+          new-eo  (assoc eo :zip-comment comment
+                           :zip-comment-length (alength cbytes))
+          new-eo-size (long (ospec/size* rec-end-of-cdr new-eo))
+          new-len     (+ (long eo-off) new-eo-size)]
+      (with-raf [r f "rw"]
+        (.setLength r new-len)
+        (let [^ByteBuffer bb (map-region r "rw" 0 new-len)]
+          (write-spec-bb! bb new-eo rec-end-of-cdr eo-off)
+          (.force ^MappedByteBuffer bb))))
+    f))
 
 (defn summarize
   "Return a compact summary map for `f`:
