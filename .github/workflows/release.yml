@@ -1,0 +1,54 @@
+name: Release
+
+# Triggered when a release tag like v0.2.0 is pushed.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+
+jobs:
+  deploy:
+    name: Deploy to Clojars
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Leiningen
+        uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          lein: latest
+
+      - name: Cache Maven & Leiningen dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.lein
+          key: ${{ runner.os }}-release-${{ hashFiles('project.clj') }}
+
+      - name: Verify project version matches tag
+        run: |
+          TAG=${GITHUB_REF##*/}     # v0.2.0
+          TAG_VER=${TAG#v}          # 0.2.0
+          PROJ_VER=$(grep -m1 defproject project.clj \
+                     | sed -E 's/.*"([0-9][^"]*)".*/\1/')
+          echo "tag version:     $TAG_VER"
+          echo "project version: $PROJ_VER"
+          test "$TAG_VER" = "$PROJ_VER"
+
+      - name: Run tests one more time
+        run: lein test
+
+      - name: Deploy to Clojars
+        env:
+          CLOJARS_USERNAME: ${{ secrets.CLOJARS_USERNAME }}
+          CLOJARS_PASSWORD: ${{ secrets.CLOJARS_PASSWORD }}
+        run: lein deploy clojars

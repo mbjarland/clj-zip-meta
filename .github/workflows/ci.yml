@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  test:
+    name: Test (Clojure ${{ matrix.clojure }}, JDK ${{ matrix.jdk }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        clojure: ["1.10", "1.11", "1.12"]
+        jdk: ["11", "17", "21"]
+        exclude:
+          # Clojure 1.10 with very recent JDKs is exotic and not a
+          # common deployment target; trim the matrix to keep CI fast.
+          - clojure: "1.10"
+            jdk: "21"
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ matrix.jdk }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.jdk }}
+
+      - name: Set up Leiningen
+        uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          lein: latest
+
+      - name: Cache Maven & Leiningen dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.lein
+          key: ${{ runner.os }}-jdk${{ matrix.jdk }}-clj${{ matrix.clojure }}-${{ hashFiles('project.clj') }}
+          restore-keys: |
+            ${{ runner.os }}-jdk${{ matrix.jdk }}-clj${{ matrix.clojure }}-
+
+      - name: Show versions
+        run: |
+          java -version
+          lein -v
+
+      - name: Run tests
+        run: lein with-profile +${{ matrix.clojure }} test
+
+      - name: Run reflection check (Clojure 1.12 / JDK 21 only)
+        if: matrix.clojure == '1.12' && matrix.jdk == '21'
+        run: lein check 2>&1 | tee check.log; ! grep -q 'Reflection warning, clj_zip_meta' check.log
