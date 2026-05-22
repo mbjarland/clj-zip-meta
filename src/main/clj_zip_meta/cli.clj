@@ -21,7 +21,8 @@
     "  meta      FILE                Pretty-print the full metadata map"
     "  summary   FILE                Print a high-level summary"
     "  comment   FILE [new-comment]  Print or set the archive comment"
-    "  validate  FILE                Check metadata for self-consistency"
+    "  validate  FILE [--crc]        Check metadata (and optionally CRC-32)"
+    "  verify    FILE                Decompress every entry and check CRC-32"
     "  repair    FILE [--strip]      Repair offset drift or rebuild a missing CDR"
     ""]))
 
@@ -47,13 +48,32 @@
         (println "comment updated"))
     (println (zm/zip-comment f))))
 
-(defn- validate-cmd [f]
-  (let [{:keys [valid? issues extra-bytes]} (zm/validate-zip-meta f)]
+(defn- validate-cmd [f flags]
+  (let [crc?   (contains? (set flags) "--crc")
+        {:keys [valid? issues extra-bytes]}
+        (zm/validate-zip-meta f :verify-crcs crc?)]
     (println (str "extra-bytes: " extra-bytes))
     (if valid?
       (println "OK")
       (do (println "FAILED")
           (run! #(println (str "  - " %)) issues)
+          (System/exit 1)))))
+
+(defn- verify-cmd [f]
+  (let [{:keys [valid? total counts mismatches errors]}
+        (zm/verify-crcs-summary f)]
+    (println (str "total:    " total))
+    (doseq [[s n] (sort-by key counts)]
+      (println (format "  %-22s %d" (name s) n)))
+    (if valid?
+      (println "OK")
+      (do (when (seq mismatches)
+            (println "mismatches:")
+            (doseq [m mismatches] (println (str "  - " (:file-name m)))))
+          (when (seq errors)
+            (println "errors:")
+            (doseq [m errors]
+              (println (str "  - " (:file-name m) ": " (:error m)))))
           (System/exit 1)))))
 
 (defn- repair-cmd [f flags]
@@ -73,7 +93,8 @@
       "meta"     (print-meta file)
       "summary"  (print-summary file)
       "comment"  (comment-cmd file (first rest))
-      "validate" (validate-cmd file)
+      "validate" (validate-cmd file rest)
+      "verify"   (verify-cmd file)
       "repair"   (repair-cmd file rest)
       (do (println usage)
           (flush)

@@ -34,7 +34,8 @@
            (java.nio.channels FileChannel FileChannel$MapMode)
            (java.nio.charset StandardCharsets)
            (java.time LocalDateTime)
-           (java.util Arrays)))
+           (java.util Arrays)
+           (java.util.zip CRC32 Inflater)))
 
 (declare scan-backwards scan-forwards)
 
@@ -768,13 +769,17 @@
 
   Options:
 
-    `:repair` — when truthy, rewrites prepended-byte offset drift in
-                place before re-running the validation. Defaults to
-                false.
-    `:print`  — when truthy, prints each issue to `*out*`. Defaults
-                to false. Provided for compatibility with the prior
-                side-effecting behavior."
-  [f & {:keys [repair print]}]
+    `:repair`     — when truthy, rewrites prepended-byte offset
+                    drift in place before re-running the validation.
+                    Defaults to false.
+    `:verify-crcs` — when truthy, also runs `verify-crcs` and rolls
+                    any CRC mismatches / inflate errors into the
+                    `:issues` vector. Defaults to false because it
+                    has to read every entry's compressed data.
+    `:print`      — when truthy, prints each issue to `*out*`.
+                    Defaults to false. Provided for compatibility
+                    with the prior side-effecting behavior."
+  [f & {:keys [repair print verify-crcs]}]
   (when repair
     (repair-zip-with-preamble-bytes f))
   (let [meta   (zip-meta f)
@@ -782,6 +787,10 @@
         locals (:local-records meta)
         cdrs   (:cdr-records meta)
         extra  (long (:extra-bytes meta))
+        crc-fail (when verify-crcs
+                   (->> (verify-crcs f)
+                        (filter #(contains? #{:mismatch :error} (:status %)))
+                        seq))
         issues (cond-> []
                  (pos? extra)
                  (conj (str extra " extra bytes at beginning or within zipfile"))
@@ -800,7 +809,12 @@
                          (not (valid-signature? f offset 4
                                                 (sig-bytes rec-local-file-header-sig))))
                        locals)
-                 (conj "invalid local record signatures found"))]
+                 (conj "invalid local record signatures found")
+
+                 crc-fail
+                 (into (map (fn [r]
+                              (str "CRC " (name (:status r)) " for " (:file-name r)))
+                            crc-fail)))]
     (when print (run! println issues))
     {:valid?      (empty? issues)
      :issues      issues
@@ -1172,6 +1186,11 @@
     `:crc-32`              — CRC-32 of the uncompressed data
     `:compression-method`  — 0 = stored, 8 = deflate, etc.
     `:offset`              — file offset of the CDR record
+    `:directory?`          — true if the entry is a directory
+    `:encrypted?`          — true if general-purpose bit 0 is set
+    `:last-modified`       — `java.time.LocalDateTime` of the entry
+    `:unix-mode`           — Unix file mode (octal) or nil
+    `:dos-attributes`      — set of DOS-attribute keywords
 
   Reads only the central directory — much faster than `zip-meta` for
   archives with many entries when local file headers are not needed."
@@ -1184,7 +1203,12 @@
        :uncompressed-size  (:uncompressed-size cdr)
        :crc-32             (:crc-32 cdr)
        :compression-method (:compression-method cdr)
-       :offset             offset})
+       :offset             offset
+       :directory?         (:directory? cdr)
+       :encrypted?         (:encrypted? cdr)
+       :last-modified      (:last-modified cdr)
+       :unix-mode          (:unix-mode cdr)
+       :dos-attributes     (:dos-attributes cdr)})
     (:cdr-records (zip-meta f {:include-locals false}))))
 
 (defn find-entry
@@ -1192,6 +1216,113 @@
   compact summary map (see `zip-entries`) or `nil` if not found."
   [f file-name]
   (some #(when (= (:file-name %) file-name) %) (zip-entries f)))
+
+;; ----------------------------------------------------------------------------
+;; CRC verification
+
+(defn- compute-crc-for-entry
+  "Verify one entry's data against its recorded CRC-32. Returns a
+  map with :file-name, :status (`:ok` / `:mismatch` / `:empty` /
+  `:unsupported-method` / `:error`), :recorded-crc, optional
+  :computed-crc, optional :error / :method."
+  [^ByteBuffer file-bb cdr ^long extra-bytes]
+  (let [name      (:file-name cdr)
+        recorded  (long (:crc-32 cdr))
+        recorded* (bit-and 0xFFFFFFFF recorded)
+        meth      (long (:compression-method cdr))
+        usize     (long (:uncompressed-size cdr))
+        csize     (long (:compressed-size cdr))
+        lfh-off   (+ (long (:relative-offset-local-header cdr)) extra-bytes)
+        nlen      (bit-and 0xFFFF (long (.getShort file-bb (int (+ lfh-off 26)))))
+        elen      (bit-and 0xFFFF (long (.getShort file-bb (int (+ lfh-off 28)))))
+        data-off  (+ lfh-off 30 nlen elen)
+        base      {:file-name name :recorded-crc recorded}]
+    (cond
+      (zero? usize)
+      (assoc base :status :empty)
+
+      (= 0 meth)
+      (try
+        (let [data (byte-array (int csize))]
+          (.position file-bb (int data-off))
+          (.get file-bb data)
+          (let [c        (doto (CRC32.) (.update data))
+                computed (.getValue c)]
+            (assoc base
+              :status       (if (= recorded* computed) :ok :mismatch)
+              :computed-crc computed)))
+        (catch Exception e
+          (assoc base :status :error :error (.getMessage e))))
+
+      (= 8 meth)
+      (let [compressed (byte-array (int csize))
+            inflater   (Inflater. true)]
+        (try
+          (.position file-bb (int data-off))
+          (.get file-bb compressed)
+          (.setInput inflater compressed)
+          (let [out    (byte-array (int usize))
+                ilen   (.inflate inflater out 0 (int usize))
+                c      (doto (CRC32.) (.update out 0 ilen))
+                computed (.getValue c)]
+            (assoc base
+              :status       (if (= recorded* computed) :ok :mismatch)
+              :computed-crc computed))
+          (catch Exception e
+            (assoc base :status :error :error (.getMessage e)))
+          (finally (.end inflater))))
+
+      :else
+      (assoc base :status :unsupported-method :method meth))))
+
+(defn verify-crcs
+  "Read every entry's compressed data from `f`, decompress it, and
+  compare the resulting CRC-32 against the value recorded in the
+  central directory. Returns a vector of maps, one per entry:
+
+      {:file-name    the entry name
+       :status       :ok | :mismatch | :empty | :unsupported-method | :error
+       :recorded-crc the recorded CRC-32 (signed long, as octet returns)
+       :computed-crc the computed CRC-32 (unsigned long; only present
+                      when actually computed)
+       :method       the compression method (only when :unsupported-method)
+       :error        the exception message (only when :error)}
+
+  Supports STORED (0) and DEFLATE (8) — the methods used by every
+  jar and the vast majority of zips. Other methods (BZIP2, LZMA,
+  etc.) yield `:unsupported-method` so the caller can decide whether
+  to treat that as a failure.
+
+  This is the strongest integrity check the library performs: it
+  verifies the data itself, not just the metadata."
+  [f]
+  (with-raf [r f "r"]
+    (let [len            (.length r)
+          ^ByteBuffer bb (map-region r "r" 0 len)
+          m              (zip-meta r {:decode false :include-locals false})
+          extra          (long (:extra-bytes m))]
+      (mapv #(compute-crc-for-entry bb (:record %) extra) (:cdr-records m)))))
+
+(defn verify-crcs-summary
+  "Run `verify-crcs` and return a map summarising the per-status
+  counts plus the entries (if any) whose CRC did not match:
+
+      {:total       N
+       :counts      {:ok N :mismatch N :empty N
+                     :unsupported-method N :error N}
+       :mismatches  [{...verify entry...} ...]
+       :errors      [{...} ...]
+       :valid?      true iff every non-skipped entry verified}"
+  [f]
+  (let [results (verify-crcs f)
+        counts  (frequencies (map :status results))
+        mis     (filterv #(= :mismatch (:status %)) results)
+        errs    (filterv #(= :error    (:status %)) results)]
+    {:total      (count results)
+     :counts     counts
+     :mismatches mis
+     :errors     errs
+     :valid?     (and (empty? mis) (empty? errs))}))
 
 (defn zip-comment
   "Return the archive-level comment from `f` (an empty string if

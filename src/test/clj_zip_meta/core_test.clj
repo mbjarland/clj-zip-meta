@@ -191,6 +191,13 @@
     (is (= "hello, comment!" (zm/zip-comment tmp)))
     (is (true? (:valid? (zm/validate-zip-meta tmp))))))
 
+(deftest verify-crcs-passes-on-intact-archive
+  (let [results (zm/verify-crcs good-file)
+        summary (zm/verify-crcs-summary good-file)]
+    (is (every? #{:ok :empty} (map :status results)))
+    (is (true? (:valid? summary)))
+    (is (zero? (count (:mismatches summary))))))
+
 (deftest cdr-records-have-decoded-convenience-keys
   (let [recs (->> (zm/zip-meta good-file) :cdr-records (mapv :record))
         dir  (first (filter :directory? recs))
@@ -257,6 +264,41 @@
   (let [path (write-test-zip {"alpha.txt" "a" "beta.txt" "b" "gamma.txt" "g"})]
     (is (= "beta.txt" (:file-name (zm/find-entry path "beta.txt"))))
     (is (nil? (zm/find-entry path "nope.txt")))))
+
+(deftest verify-crcs-detects-tampering
+  ;; Build a real zip, then flip a byte inside the compressed payload
+  ;; of one entry. The CRC should no longer match.
+  (let [path (write-test-zip {"hello.txt" "the quick brown fox jumps over the lazy dog"
+                              "two.txt"   "two"})
+        m    (zm/zip-meta path)
+        ;; ZipOutputStream uses data descriptors, so the LFH carries
+        ;; zero sizes. Use the CDR's authoritative :compressed-size
+        ;; and pair it with the matching LFH offset from
+        ;; :local-records.
+        cdr-rec (first (filter #(pos? (long (-> % :record :compressed-size)))
+                                (:cdr-records m)))
+        cdr     (:record cdr-rec)
+        lfh-rec (some #(when (= (-> % :record :file-name) (:file-name cdr)) %)
+                       (:local-records m))
+        lfh     (:record lfh-rec)
+        data-off (+ (long (:offset lfh-rec))
+                    30
+                    (bit-and 0xFFFF (long (:file-name-length lfh)))
+                    (bit-and 0xFFFF (long (:extra-field-length lfh))))]
+    (with-open [r (RandomAccessFile. path "rw")]
+      (.seek r data-off)
+      (let [b (.readByte r)]
+        (.seek r data-off)
+        (.writeByte r (bit-xor (int b) 0xFF))))
+    (let [results (zm/verify-crcs path)
+          summary (zm/verify-crcs-summary path)]
+      (is (false? (:valid? summary)))
+      ;; Flipping a byte inside a deflate stream usually makes the
+      ;; stream itself unparseable, which surfaces as :error from the
+      ;; inflater. On the off chance the bit happens to land in a
+      ;; non-load-bearing position the bytes still inflate but the
+      ;; CRC will mismatch. Either outcome counts as detection.
+      (is (some #(contains? #{:mismatch :error} (:status %)) results)))))
 
 (deftest creates-and-parses-a-test-zip
   (let [path (write-test-zip {"a.txt" "alpha" "b.txt" "bravo"})
