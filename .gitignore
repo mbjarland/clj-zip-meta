@@ -21,6 +21,7 @@ pom.xml.asc
 .vscode
 .lsp
 .calva
+.claude
 
 # OS noise
 .DS_Store
