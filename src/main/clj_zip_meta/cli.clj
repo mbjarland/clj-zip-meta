@@ -11,6 +11,8 @@
             [clojure.walk :as walk])
   (:gen-class))
 
+(def ^:private version "0.3.0")
+
 (def ^:private usage
   (str/join
    "\n"
@@ -27,8 +29,9 @@
     "  verify    FILE                Decompress every entry and check CRC-32"
     "  repair    FILE [--strip]      Repair offset drift or rebuild a missing CDR"
     ""
-    "Global flag:"
-    "  --json    Emit JSON on stdout instead of human-readable text"
+    "Global flags:"
+    "  --json     Emit JSON on stdout instead of human-readable text"
+    "  --version  Print the library version and exit"
     ""]))
 
 ;; --- minimal JSON emitter -------------------------------------------------
@@ -180,6 +183,10 @@
     (when (= :failed (:status r)) (System/exit 1))))
 
 (defn -main [& args]
+  (when (some #(= "--version" %) args)
+    (println (str "clj-zip-meta " version))
+    (flush)
+    (System/exit 0))
   (let [json? (boolean (some #(= "--json" %) args))
         args  (remove #(= "--json" %) args)
         [cmd file & rest] args]

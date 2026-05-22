@@ -191,6 +191,30 @@
     (is (= "hello, comment!" (zm/zip-comment tmp)))
     (is (true? (:valid? (zm/validate-zip-meta tmp))))))
 
+(deftest round-trip-rewrite-preserves-everything
+  ;; A no-op repair-zip-with-preamble-bytes (extra-bytes = 0) should
+  ;; leave the file byte-identical, but more interestingly: a repair on
+  ;; an archive with preamble bytes should still produce something that
+  ;; zip-meta parses to a structurally identical CDR (same offsets and
+  ;; primitive fields) after the round trip.
+  (let [tmp     (copy-to-tmp bad-prelude-file "round-trip-")
+        before  (zm/zip-meta tmp {:decode false})]
+    (zm/repair-zip-with-preamble-bytes tmp)
+    (let [after (zm/zip-meta tmp {:decode false})]
+      (is (= 0 (:extra-bytes after)))
+      (is (= (count (:cdr-records before))
+             (count (:cdr-records after))))
+      ;; Primitive fields preserved (the offsets bumped by extra-bytes).
+      (let [extra 317]
+        (doseq [[b a] (map vector (:cdr-records before) (:cdr-records after))]
+          (let [br (:record b) ar (:record a)]
+            (is (= (:file-name br)         (:file-name ar)))
+            (is (= (:crc-32 br)            (:crc-32 ar)))
+            (is (= (:compressed-size br)   (:compressed-size ar)))
+            (is (= (:uncompressed-size br) (:uncompressed-size ar)))
+            (is (= (+ extra (long (:relative-offset-local-header br)))
+                   (:relative-offset-local-header ar)))))))))
+
 (deftest verify-crcs-passes-on-intact-archive
   (let [results (zm/verify-crcs good-file)
         summary (zm/verify-crcs-summary good-file)]
