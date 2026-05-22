@@ -489,6 +489,358 @@
      :extra-bytes extra}))
 
 ;; ============================================================================
+;; Deep repair: rebuild CDR/EOCDR from local file headers
+
+(def ^:private lfh-sig-int   0x04034b50)
+(def ^:private cdr-sig-int   0x02014b50)
+(def ^:private eocdr-sig-int 0x06054b50)
+(def ^:private data-desc-sig-int 0x08074b50)
+
+(defn- locate-data-descriptor
+  "Scan `bb` from `data-start` to `end` for a data descriptor that
+  validates: the descriptor's `compressed-size` must match the
+  distance from `data-start` to the descriptor itself.
+
+  Handles three cases:
+    1. The optional 0x08074b50 signature appears, followed by the
+       12 data-descriptor bytes (used by Java's `ZipOutputStream`).
+       Located by direct signature match — works even when the
+       descriptor is the very last record in the file.
+    2. The descriptor has no signature; we locate the following
+       LFH / CDR / EOCDR record and back up 12 bytes.
+    3. The descriptor has a signature AND is followed by another
+       record; case (1) finds it first.
+
+  Returns
+
+      {:dd-start          descriptor first byte
+       :next-sig-pos      offset of the next LFH/CDR/EOCDR (or
+                           data-descriptor-end when EOF)
+       :crc-32            crc-32 from the descriptor
+       :compressed-size   from the descriptor
+       :uncompressed-size from the descriptor}
+
+  or `nil` if no validating descriptor is found before `end`."
+  [^ByteBuffer bb ^long data-start ^long end]
+  (let [limit (- end 4)]
+    (loop [i data-start]
+      (when (<= i limit)
+        (let [v (.getInt bb (int i))]
+          (cond
+            (= v data-desc-sig-int)
+            (let [dd-start  i
+                  crc-off   (+ dd-start 4)
+                  has-room? (<= (+ crc-off 12) end)
+                  csize     (when has-room? (.getInt bb (int (+ crc-off 4))))
+                  actual    (- dd-start data-start)]
+              (if (and has-room? (= (long csize) actual))
+                {:dd-start          dd-start
+                 :next-sig-pos      (+ dd-start 16)
+                 :crc-32            (.getInt bb (int crc-off))
+                 :compressed-size   csize
+                 :uncompressed-size (.getInt bb (int (+ crc-off 8)))}
+                (recur (inc i))))
+
+            (or (= v lfh-sig-int) (= v cdr-sig-int) (= v eocdr-sig-int))
+            (let [dd-with-sig? (and (>= i (+ data-start 16))
+                                    (= data-desc-sig-int
+                                       (.getInt bb (int (- i 16)))))
+                  dd-start (if dd-with-sig? (- i 16) (- i 12))
+                  crc-off  (if dd-with-sig? (+ dd-start 4) dd-start)
+                  ok?      (and (>= dd-start data-start)
+                                (>= crc-off 0))
+                  csize    (when ok? (.getInt bb (int (+ crc-off 4))))
+                  actual   (- dd-start data-start)]
+              (if (and ok? (= (long csize) actual))
+                {:dd-start          dd-start
+                 :next-sig-pos      i
+                 :crc-32            (.getInt bb (int crc-off))
+                 :compressed-size   csize
+                 :uncompressed-size (.getInt bb (int (+ crc-off 8)))}
+                (recur (inc i))))
+
+            :else
+            (recur (inc i))))))))
+
+(defn scan-local-headers
+  "Walk file `f` from `:extra-bytes` (default 0) and return a vector of
+  `{:offset N :record M}` maps, one per local file header found.
+
+  The cursor moves through the archive by reading each LFH and then
+  advancing past its data. When an entry uses a data descriptor
+  (general-purpose bit 3) — the compressed-size in the LFH is zero —
+  this function scans forward for the descriptor (with or without its
+  optional 0x08074b50 signature), validates it against the actual
+  data length, and yields an LFH record with the correct sizes and
+  CRC-32 patched in. Scanning stops at the first central directory
+  header or EOCDR.
+
+  Useful for reconstructing a missing or corrupt central directory.
+
+  Throws `ex-info` when a data descriptor cannot be located for an
+  entry that claims one (corruption or truncation past the data
+  descriptor)."
+  ([f] (scan-local-headers f {}))
+  ([f {:keys [extra-bytes max-entries]
+       :or   {extra-bytes 0 max-entries 1000000}}]
+   (with-raf [r f "r"]
+     (let [len            (.length r)
+           ^ByteBuffer bb (map-region r "r" 0 len)
+           lfh-sig        (sig-bytes rec-local-file-header-sig)]
+       (loop [pos   (long extra-bytes)
+              acc   (transient [])
+              guard (long max-entries)]
+         (cond
+           (zero? guard)
+           (throw (ex-info "scan-local-headers exceeded max-entries"
+                           {:max-entries max-entries :found (count acc)}))
+
+           (> (+ pos 4) len)
+           (persistent! acc)
+
+           :else
+           (let [sig-int (.getInt bb (int pos))]
+             (cond
+               (or (= cdr-sig-int sig-int) (= eocdr-sig-int sig-int))
+               (persistent! acc)
+
+               (= lfh-sig-int sig-int)
+               (let [lfh      (read-spec-bb bb rec-local-file-header pos)
+                     gp       (long (:general-purpose lfh))
+                     hdr-size (long (ospec/size* rec-local-file-header lfh))]
+                 (if (pos? (bit-and gp 0x8))
+                   (let [data-start (+ pos hdr-size)
+                         dd         (locate-data-descriptor bb data-start len)]
+                     (if-not dd
+                       (throw (ex-info "Cannot locate data descriptor for entry"
+                                       {:file (str f) :offset pos
+                                        :file-name (:file-name lfh)}))
+                       (recur (long (:next-sig-pos dd))
+                              (conj! acc {:offset pos
+                                          :end-offset (:next-sig-pos dd)
+                                          :record (assoc lfh
+                                                    :compressed-size   (:compressed-size dd)
+                                                    :uncompressed-size (:uncompressed-size dd)
+                                                    :crc-32            (:crc-32 dd))})
+                              (dec guard))))
+                   (let [next-pos (+ pos hdr-size (long (:compressed-size lfh)))]
+                     (recur next-pos
+                            (conj! acc {:offset pos :end-offset next-pos :record lfh})
+                            (dec guard)))))
+
+               :else
+               (if-let [next-pos (find-byte-pattern r lfh-sig pos 1)]
+                 (recur (long next-pos) acc guard)
+                 (persistent! acc))))))))))
+
+(defn- lfh->cdr
+  "Build a CDR record from a local file header `lfh` whose data
+  begins at `relative-offset` bytes into the zip payload (i.e. after
+  any prepended preamble)."
+  [lfh ^long relative-offset]
+  (let [name (:file-name lfh)
+        dir? (and (string? name) (str/ends-with? name "/"))]
+    {:cdr-header-signature         cdr-sig-int
+     :version-made-by              0x14
+     :version-needed-to-extract    (:version-needed-to-extract lfh)
+     :general-purpose              (:general-purpose lfh)
+     :compression-method           (:compression-method lfh)
+     :last-mod-file-time           (:last-mod-file-time lfh)
+     :last-mod-file-date           (:last-mod-file-date lfh)
+     :crc-32                       (:crc-32 lfh)
+     :compressed-size              (:compressed-size lfh)
+     :uncompressed-size            (:uncompressed-size lfh)
+     :file-name-length             (:file-name-length lfh)
+     :extra-field-length           (:extra-field-length lfh)
+     :file-comment-length          0
+     :disk-number-start            0
+     :internal-file-attributes     0
+     :external-file-attributes     (if dir? 0x10 0)
+     :relative-offset-local-header relative-offset
+     :file-name                    name
+     :extra-field                  (:extra-field lfh)
+     :file-comment                 ""}))
+
+(defn- mk-eocdr
+  [cdrs ^long cdr-offset ^long cdr-size ^String zip-comment]
+  (let [n (count cdrs)]
+    {:end-of-cdr-signature       eocdr-sig-int
+     :number-of-this-disk        0
+     :number-of-cdr-disk         0
+     :cdr-entries-this-disk      n
+     :cdr-entries-total          n
+     :cdr-size                   cdr-size
+     :cdr-offset-from-start-disk cdr-offset
+     :zip-comment-length         (count (.getBytes zip-comment "UTF-8"))
+     :zip-comment                zip-comment}))
+
+(defn rebuild-central-directory!
+  "Rebuild the central directory and end-of-central-directory record
+  in `f` from the local file headers found in the archive. The new
+  CDR is written immediately after the last entry's data and the file
+  is truncated at the end of the new EOCDR.
+
+  Opts (all optional):
+
+    `:extra-bytes`         number of prepended bytes before the zip
+                            payload (default: auto-detect via
+                            `zip-meta`, falling back to 0)
+    `:zip-comment`         archive comment to use (default \"\")
+    `:preserve-attrs?`     when truthy, read the file's existing CDR
+                            entries (if any) and copy their
+                            `:internal-file-attributes`,
+                            `:external-file-attributes`,
+                            `:version-made-by`, and `:file-comment`
+                            fields onto the rebuilt entries (matched
+                            by `:file-name`). Default true.
+
+  Returns `f`. Throws `ex-info` if no local file headers are found or
+  if any entry uses a data descriptor (general-purpose bit 3)."
+  ([f] (rebuild-central-directory! f {}))
+  ([f {:keys [extra-bytes zip-comment preserve-attrs?]
+       :or   {zip-comment "" preserve-attrs? true}}]
+   (let [extra  (long (or extra-bytes
+                          (try (:extra-bytes (zip-meta f))
+                               (catch clojure.lang.ExceptionInfo _ 0))))
+         locals (scan-local-headers f {:extra-bytes extra})
+         _      (when (empty? locals)
+                  (throw (ex-info "Cannot rebuild central directory: no local file headers found"
+                                  {:file (str f) :extra-bytes extra})))
+         attrs  (when preserve-attrs?
+                  (try
+                    (into {}
+                          (map (fn [{:keys [record]}]
+                                 [(:file-name record)
+                                  (select-keys record [:internal-file-attributes
+                                                       :external-file-attributes
+                                                       :version-made-by
+                                                       :file-comment
+                                                       :file-comment-length])]))
+                          (:cdr-records (zip-meta f)))
+                    (catch clojure.lang.ExceptionInfo _ {})))
+         cdrs   (mapv (fn [{:keys [offset record]}]
+                        (let [base (lfh->cdr record (- offset extra))]
+                          (if-let [a (get attrs (:file-name record))]
+                            (merge base a)
+                            base)))
+                      locals)
+         cdr-start (long (:end-offset (last locals)))
+         cdr-size  (reduce + 0 (map #(long (ospec/size* rec-cdr-header %)) cdrs))
+         eocdr     (mk-eocdr cdrs (- cdr-start extra) cdr-size zip-comment)
+         eocdr-size (long (ospec/size* rec-end-of-cdr eocdr))
+         total     (+ cdr-start cdr-size eocdr-size)]
+     (with-raf [r f "rw"]
+       (.setLength r total)
+       (let [^ByteBuffer bb (map-region r "rw" 0 total)]
+         (loop [pos cdr-start
+                rs  cdrs]
+           (when-let [rec (first rs)]
+             (write-spec-bb! bb rec rec-cdr-header pos)
+             (recur (+ pos (long (ospec/size* rec-cdr-header rec)))
+                    (rest rs))))
+         (write-spec-bb! bb eocdr rec-end-of-cdr (+ cdr-start cdr-size))
+         (.force ^MappedByteBuffer bb)))
+     f)))
+
+(defn strip-preamble!
+  "Physically remove the bytes prepended before the zip payload in
+  `f`. After this call the file is `extra-bytes` shorter and the
+  recorded CDR/EOCDR offsets — which were already correct for the
+  un-prepended archive — match the file again.
+
+  Returns `f`. No-op when there are no extra bytes.
+
+  Important: do not call this after `repair-zip-with-preamble-bytes`
+  on the same archive. The repair function bumps the recorded offsets
+  by the preamble length; if you then strip the preamble too, the
+  offsets become wrong in the other direction. Use one or the other,
+  not both."
+  [f]
+  (let [m     (zip-meta f)
+        extra (long (:extra-bytes m))]
+    (when (pos? extra)
+      (with-raf [r f "rw"]
+        (let [len      (.length r)
+              new-len  (- len extra)
+              ;; Buffer size must not exceed `extra`, otherwise the read
+              ;; region would overlap the just-written destination.
+              buf-size (int (min extra 0x100000))
+              buf      (byte-array buf-size)]
+          (loop [src (long extra) dst 0]
+            (when (< dst new-len)
+              (let [n (int (min buf-size (- new-len dst)))]
+                (.seek r src)
+                (.readFully r buf 0 n)
+                (.seek r (long dst))
+                (.write r buf 0 n)
+                (recur (+ src n) (+ dst n)))))
+          (.setLength r new-len)
+          (.. r getFD sync))))
+    f))
+
+(defn repair-zip
+  "Attempt a holistic repair of `f`.
+
+  Strategy:
+
+    1. If the archive parses but reports `:extra-bytes > 0`:
+       - With `:strip-preamble true`, physically remove the prepended
+         bytes (the file shrinks).
+       - Otherwise, rewrite the recorded offsets so they match the
+         file again (the file size is unchanged).
+    2. If the archive does NOT parse (missing EOCDR or CDR-signature
+       mismatch) and `:rebuild-cdr` is truthy (default), rebuild the
+       central directory from the local file headers.
+    3. A final `validate-zip-meta` is run to confirm the result.
+
+  Returns a map:
+
+    `:status`   :ok | :failed
+    `:actions`  vector of keywords describing what was done
+                (`:preamble-fix`, `:preamble-stripped`,
+                `:cdr-rebuilt`, `:no-op`)
+    `:before`   the meta map before repair, or `nil` if unreadable
+    `:after`    the meta map after repair, when status is :ok
+    `:issues`   vector of remaining validation issues, when failed
+    `:error`    error message, when failed unrecoverably"
+  ([f] (repair-zip f {}))
+  ([f opts]
+   (let [{:keys [rebuild-cdr strip-preamble zip-comment]
+          :or   {rebuild-cdr true strip-preamble false}} opts
+         before (try (zip-meta f)
+                     (catch clojure.lang.ExceptionInfo _ nil))
+         actions (transient [])]
+     (try
+       (cond
+         (and before (pos? (long (:extra-bytes before))))
+         (if strip-preamble
+           (do (strip-preamble! f) (conj! actions :preamble-stripped))
+           (do (repair-zip-with-preamble-bytes f) (conj! actions :preamble-fix)))
+
+         (nil? before)
+         (if rebuild-cdr
+           (do (rebuild-central-directory! f
+                                           (cond-> {}
+                                             zip-comment (assoc :zip-comment zip-comment)))
+               (conj! actions :cdr-rebuilt))
+           (throw (ex-info "Cannot read archive metadata and :rebuild-cdr is false"
+                           {:file (str f)})))
+
+         :else
+         (conj! actions :no-op))
+
+       (let [v (validate-zip-meta f)]
+         (if (:valid? v)
+           {:status :ok :actions (persistent! actions)
+            :before before :after (zip-meta f)}
+           {:status :failed :actions (persistent! actions)
+            :before before :issues (:issues v)}))
+       (catch Exception e
+         {:status :failed :actions (persistent! actions)
+          :before before :error (.getMessage e)
+          :data (ex-data e)})))))
+
+;; ============================================================================
 ;; Convenience / ergonomic API
 
 (defn zip-entries
