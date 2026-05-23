@@ -1450,6 +1450,101 @@
   (get-in (zip-meta f {:include-locals false})
           [:end-of-cdr-record :record :zip-comment]))
 
+(defn update-cdr-entries!
+  "Rewrite the central directory of `f` by mapping `updater` over each
+  CDR record. The updater receives the current record (with the
+  decoded convenience keys) and should return one of:
+
+    a new record map  → replaces the entry
+    `nil`             → drops the entry from the central directory
+
+  The file is resized to fit the new CDR + EOCDR. Variable-length
+  fields (`:file-name`, `:extra-field`, `:file-comment`) are
+  re-measured from the string / byte-array data on write, so the
+  recorded `*-length` fields do not need to be kept in sync by the
+  caller.
+
+  Returns `f`. Dropped entries leave their local file header and
+  data orphaned in the archive — the resulting file is still a valid
+  zip but it is no larger than before (use `:strip-preamble` style
+  rewriting if compaction matters).
+
+  Examples:
+
+    ;; Set every entry's Unix mode to 0644
+    (update-cdr-entries! \"my.jar\"
+      #(assoc % :external-file-attributes (bit-shift-left 0644 16)))
+
+    ;; Zero out timestamps for a reproducible build
+    (update-cdr-entries! \"my.jar\"
+      #(assoc % :last-mod-file-date 0 :last-mod-file-time 0))
+
+    ;; Drop any temp-file entries
+    (update-cdr-entries! \"my.jar\"
+      (fn [e] (when-not (re-find #\"\\.tmp$\" (:file-name e)) e)))"
+  [f updater]
+  (let [m         (zip-meta f {:include-locals false})
+        eo        (:record (:end-of-cdr-record m))
+        extra     (long (:extra-bytes m))
+        cdr-start (+ (long (:cdr-offset-from-start-disk eo)) extra)
+        new-cdrs  (->> (:cdr-records m)
+                       (keep (fn [{:keys [record]}] (updater record)))
+                       vec)
+        new-csize (reduce + 0 (map cdr-size* new-cdrs))
+        zip-cmt   (or (:zip-comment eo) "")
+        new-eo    (-> eo
+                      (assoc :cdr-size              new-csize)
+                      (assoc :cdr-entries-this-disk (count new-cdrs))
+                      (assoc :cdr-entries-total     (count new-cdrs))
+                      (assoc :zip-comment           zip-cmt)
+                      (assoc :zip-comment-length    (alength (.getBytes ^String zip-cmt "UTF-8"))))
+        new-eo-sz (+ 22 (long (:zip-comment-length new-eo)))
+        total     (+ cdr-start new-csize new-eo-sz)]
+    (with-raf [r f "rw"]
+      (.setLength r total)
+      (let [^ByteBuffer bb (map-region r "rw" 0 total)]
+        (loop [pos cdr-start
+               rs  new-cdrs]
+          (when-let [rec (first rs)]
+            (write-cdr! bb pos rec)
+            (recur (+ pos (cdr-size* rec))
+                   (rest rs))))
+        (write-eocdr! bb (+ cdr-start new-csize) new-eo)
+        (.force ^MappedByteBuffer bb)))
+    f))
+
+(defn set-entry-comment!
+  "Set the per-entry file comment on the entry named `file-name` in
+  `f`. The file is rewritten to accommodate the new comment length.
+  Returns `f`. Throws `ex-info` if no entry matches."
+  [f file-name comment]
+  (let [seen (volatile! false)]
+    (update-cdr-entries!
+      f
+      (fn [rec]
+        (if (= (:file-name rec) file-name)
+          (do (vreset! seen true)
+              (assoc rec :file-comment    comment
+                         :file-comment-length
+                         (alength (.getBytes ^String comment "UTF-8"))))
+          rec)))
+    (when-not @seen
+      (throw (ex-info "set-entry-comment!: no entry with that file-name"
+                      {:file (str f) :file-name file-name})))
+    f))
+
+(defn zero-timestamps!
+  "Set `:last-mod-file-date` and `:last-mod-file-time` to 0 on every
+  CDR entry — a low-effort step toward reproducible-build archives.
+  Returns `f`.
+
+  Note: only the central directory is rewritten; the local file
+  headers still carry their original timestamps. Most tools read
+  the CDR for entry metadata, so this is usually enough."
+  [f]
+  (update-cdr-entries! f #(assoc % :last-mod-file-date 0
+                                   :last-mod-file-time 0)))
+
 (defn set-zip-comment!
   "Replace the archive-level comment in `f` with `comment` (encoded
   UTF-8). The file is resized if the new comment is a different

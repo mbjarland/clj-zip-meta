@@ -328,6 +328,47 @@
       (is (= "change.txt" (:file-name c)))
       (is (not= (:crc-32 (:before c)) (:crc-32 (:after c)))))))
 
+(deftest update-cdr-entries-rewrites-each-record
+  (let [tmp (copy-to-tmp good-file "update-")]
+    (zm/update-cdr-entries! tmp
+                            #(assoc % :external-file-attributes (bit-shift-left 0644 16)))
+    (let [recs (->> (zm/zip-meta tmp) :cdr-records (mapv :record))]
+      (is (every? #(= 0644 (:unix-mode %)) recs))
+      (is (true? (:valid? (zm/validate-zip-meta tmp)))))))
+
+(deftest update-cdr-entries-can-drop-entries
+  (let [path (write-test-zip {"keep.txt" "k"
+                              "drop.tmp" "d"
+                              "also.tmp" "x"})]
+    (zm/update-cdr-entries! path
+                            (fn [r] (when-not (re-find #"\.tmp$" (:file-name r))
+                                      r)))
+    (let [recs (zm/zip-entries path)]
+      (is (= ["keep.txt"] (map :file-name recs)))
+      (is (true? (:valid? (zm/validate-zip-meta path)))))))
+
+(deftest set-entry-comment-roundtrip
+  (let [path (write-test-zip {"a.txt" "alpha" "b.txt" "beta"})]
+    (zm/set-entry-comment! path "b.txt" "hand-written comment")
+    (is (= "hand-written comment"
+           (:file-comment (zm/find-entry path "b.txt"))))
+    (is (true? (:valid? (zm/validate-zip-meta path))))))
+
+(deftest set-entry-comment-rejects-missing-entry
+  (let [path (write-test-zip {"a.txt" "alpha"})]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"no entry with that file-name"
+                          (zm/set-entry-comment! path "nope.txt" "x")))))
+
+(deftest zero-timestamps-clears-mod-time
+  (let [path (write-test-zip {"a.txt" "alpha" "b.txt" "beta"})]
+    (zm/zero-timestamps! path)
+    (let [recs (->> (zm/zip-meta path) :cdr-records (map :record))]
+      (doseq [r recs]
+        (is (zero? (long (:last-mod-file-time r))))
+        (is (zero? (long (:last-mod-file-date r))))))
+    (is (true? (:valid? (zm/validate-zip-meta path))))))
+
 (deftest hexdump-renders-classic-layout
   (let [s (zm/hexdump good-file 0 32)]
     (is (re-find #"^00000000  50 4b" s))

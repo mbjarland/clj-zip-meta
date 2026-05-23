@@ -26,6 +26,14 @@ and the format of [keepachangelog.com](https://keepachangelog.com/).
   staring at a specific record's raw bytes during a repair
   investigation. Exposed as `hexdump FILE OFFSET [LENGTH]` on the
   CLI.
+- `update-cdr-entries! f updater` — rewrite every CDR record with a
+  function. Returning `nil` from the updater drops the entry from
+  the central directory.
+- `set-entry-comment! f file-name comment` — set a single entry's
+  comment.
+- `zero-timestamps! f` — clear `:last-mod-file-time` and
+  `:last-mod-file-date` on every CDR record (a step toward
+  reproducible-build archives).
 
 ### Changed (breaking)
 - `read-spec-from-buffer`, `read-spec-from-file`,
