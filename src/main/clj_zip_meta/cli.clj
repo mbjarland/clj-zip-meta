@@ -12,7 +12,7 @@
             [clojure.walk :as walk])
   (:gen-class))
 
-(def ^:private version "0.4.0")
+(def ^:private version "0.5.0")
 
 (def ^:private usage
   (str/join
@@ -40,7 +40,7 @@
     "  diff      FILE-A FILE-B           Compare two archives by file-name + CRC"
     "  layout    FILE [--width N]        Show the physical layout of records in FILE"
     "  hexdump   FILE OFFSET [LENGTH]    Dump bytes around a record offset"
-    "  analyze   FILE                    Run safety / forensics checks"
+    "  analyze   FILE [--recursive]      Run safety / forensics checks"
     ""
     "Global flags:"
     "  --json     Emit JSON on stdout instead of human-readable text"
@@ -313,8 +313,10 @@
     (.write (System/out) ^bytes ba)
     (do (println (str "no entry named " (pr-str entry-name))) (System/exit 1))))
 
-(defn- analyze-cmd [f json?]
-  (let [r (za/analyze f)]
+(defn- analyze-cmd [f flags json?]
+  (let [recursive? (contains? (set flags) "--recursive")
+        r          (za/analyze f)
+        nested     (when recursive? (za/analyze-nested f))]
     (emit json?
           (fn []
             (println (str "safe?:               " (:safe? r)))
@@ -342,8 +344,22 @@
               (doseq [{:keys [file-name differences]} m]
                 (println (format "  %s -- fields differ: %s"
                                  file-name
-                                 (str/join ", " (map name (keys differences))))))))
-          r)
+                                 (str/join ", " (map name (keys differences)))))))
+            (when (seq nested)
+              (println)
+              (println (str "nested archives (" (count nested) "):"))
+              (doseq [{:keys [entry-name analysis error]} nested]
+                (println (format "  %s %s"
+                                 (if (:safe? analysis) "[OK]" "[!!]")
+                                 entry-name))
+                (when error
+                  (println (str "      error: " error)))
+                (when-let [u (seq (:unsafe-entries analysis))]
+                  (doseq [{e :entry rs :reasons} u]
+                    (println (format "      unsafe: %s -- %s"
+                                     (:file-name e)
+                                     (str/join "," (map name rs)))))))))
+          (cond-> r recursive? (assoc :nested nested)))
     (when-not (:safe? r) (System/exit 1))))
 
 (defn- diff-cmd [a b json?]
@@ -421,7 +437,7 @@
       "diff"     (diff-cmd file (first rest) json?)
       "layout"   (layout-cmd file rest json?)
       "hexdump"  (hexdump-cmd file (first rest) (second rest) json?)
-      "analyze"  (analyze-cmd file json?)
+      "analyze"  (analyze-cmd file rest json?)
       "manifest" (manifest-cmd file json?)
       "jar-info" (jar-info-cmd file json?)
       "describe" (describe-cmd file json?)

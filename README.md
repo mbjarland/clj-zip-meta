@@ -68,13 +68,13 @@ zip tools; `clj-zip-meta` repairs it.
 Leiningen / Boot:
 
 ```clojure
-[clj-zip-meta/clj-zip-meta "0.4.0"]
+[clj-zip-meta/clj-zip-meta "0.5.0"]
 ```
 
 deps.edn:
 
 ```clojure
-clj-zip-meta/clj-zip-meta {:mvn/version "0.4.0"}
+clj-zip-meta/clj-zip-meta {:mvn/version "0.5.0"}
 ```
 
 The repo also ships a `deps.edn` with `:test`, `:cli`, and `:bench`
@@ -103,7 +103,7 @@ bb -m clj-zip-meta.cli repair my.jar
 ```clojure
 {:deps {clj-zip-meta/clj-zip-meta
         {:git/url "https://github.com/mbjarland/clj-zip-meta"
-         :git/tag "v0.4.0"}}}
+         :git/tag "v0.5.0"}}}
 ```
 
 Requires Clojure 1.10+ and JDK 11+ for normal use, or Babashka 1.0+

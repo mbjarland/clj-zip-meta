@@ -6,6 +6,48 @@ and the format of [keepachangelog.com](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-23
+
+### Added — entry inspection
+- `extract-bytes f entry-name` — extract one entry's uncompressed
+  data in memory. Supports STORED + DEFLATE. The library still does
+  not write archives; this is for inspection only.
+- `extract-string f entry-name [charset]` — UTF-8 (or any) decode.
+
+### Added — Java / JAR understanding
+- `manifest f` — parse `META-INF/MANIFEST.MF` into a map of header
+  name to value. Handles CRLF / CR / LF and the space-prefixed
+  continuation-line convention.
+- `manifest-sections f` — `{:main … :entries [{…} …]}` so per-entry
+  attribute sections (signed jars, etc.) are addressable too.
+- `jar-info f` — distil the manifest to the fields that actually
+  matter: `:main-class`, `:implementation-version`, OSGi
+  `:bundle-symbolic-name`, Java agent `:premain-class`, etc.
+- `pom-info f` — parse
+  `META-INF/maven/{group}/{artifact}/pom.properties` into
+  `{:group-id :artifact-id :version}`.
+- `class-index f` — sorted map of Java package → sorted vector of
+  class names. The default package is keyed under `""`.
+- `describe f` — one-shot "what is this jar?" summary combining
+  `summarize`, `jar-info`, `pom-info`, class/resource counts, and
+  the top-level directories.
+
+### Added — recursive forensics
+- `clj-zip-meta.analysis/analyze-nested` — for each entry that
+  looks like a nested archive (`.jar`, `.zip`, `.war`, `.ear`),
+  extract it to a temp file and recursively run `analyze`.
+  Returns a tree of `{:entry-name :analysis :nested}` maps. Useful
+  for Spring Boot fat jars, uberjars-of-uberjars, and any payload
+  that ships archives as entries.
+
+### Added — CLI
+- `manifest FILE`         — pretty-print the manifest.
+- `jar-info FILE`         — pretty-print distilled jar fields.
+- `describe FILE`         — single-shot jar summary.
+- `classes  FILE`         — class index grouped by package.
+- `cat FILE ENTRY`        — write one entry to stdout.
+- `analyze FILE --recursive` — walk nested archives.
+
 ## [0.4.0] - 2026-05-23
 
 ### Added
@@ -223,7 +265,8 @@ and the format of [keepachangelog.com](https://keepachangelog.com/).
   local file headers from zip/jar files; repair offsets after prepending
   preamble bytes.
 
-[Unreleased]: https://github.com/mbjarland/clj-zip-meta/compare/0.4.0...HEAD
+[Unreleased]: https://github.com/mbjarland/clj-zip-meta/compare/0.5.0...HEAD
+[0.5.0]: https://github.com/mbjarland/clj-zip-meta/compare/0.4.0...0.5.0
 [0.4.0]: https://github.com/mbjarland/clj-zip-meta/compare/0.3.0...0.4.0
 [0.3.0]: https://github.com/mbjarland/clj-zip-meta/compare/0.2.0...0.3.0
 [0.2.0]: https://github.com/mbjarland/clj-zip-meta/compare/0.1.3...0.2.0

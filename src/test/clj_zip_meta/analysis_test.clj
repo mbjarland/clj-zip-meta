@@ -144,3 +144,33 @@
 
 (deftest zip64-false-for-normal-archive
   (is (false? (za/zip64? good-file))))
+
+;; ---------------------------------------------------------------------------
+;; analyze-nested
+
+(deftest analyze-nested-walks-into-jar-entries
+  ;; Build a stored zip whose only entry is itself a zip.
+  (let [inner-bytes (let [baos (ByteArrayOutputStream.)]
+                      (with-open [out (ZipOutputStream. baos)]
+                        (.putNextEntry out (ZipEntry. "../inner-escape"))
+                        (.write out (.getBytes "boom" "UTF-8"))
+                        (.closeEntry out))
+                      (.toByteArray baos))
+        outer (doto (File/createTempFile "outer-" ".jar") (.deleteOnExit))]
+    (with-open [out (ZipOutputStream. (FileOutputStream. outer))]
+      (let [crc (doto (CRC32.) (.update inner-bytes))
+            entry (doto (ZipEntry. "lib/inner.jar")
+                    (.setMethod ZipEntry/STORED)
+                    (.setSize (alength inner-bytes))
+                    (.setCompressedSize (alength inner-bytes))
+                    (.setCrc (.getValue crc)))]
+        (.putNextEntry out entry)
+        (.write out inner-bytes)
+        (.closeEntry out)))
+    (let [nested (za/analyze-nested (.getAbsolutePath outer))]
+      (is (= 1 (count nested)))
+      (let [{:keys [entry-name analysis]} (first nested)]
+        (is (= "lib/inner.jar" entry-name))
+        (is (= 1 (count (:unsafe-entries analysis))))
+        (is (= "../inner-escape"
+               (-> analysis :unsafe-entries first :entry :file-name)))))))
