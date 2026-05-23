@@ -29,7 +29,7 @@
            (java.util Arrays)
            (java.util.zip CRC32 Inflater)))
 
-(declare scan-backwards scan-forwards summarize)
+(declare scan-backwards scan-forwards summarize verify-crcs)
 
 ;; ============================================================================
 ;; Internal helpers
@@ -858,15 +858,16 @@
     `:print`      — when truthy, prints each issue to `*out*`.
                     Defaults to false. Provided for compatibility
                     with the prior side-effecting behavior."
-  [f & {:keys [repair print verify-crcs]}]
+  [f & {:keys [repair print] :as opts}]
   (when repair
     (repair-zip-with-preamble-bytes f))
-  (let [meta   (zip-meta f)
+  (let [check-crcs? (:verify-crcs opts)
+        meta   (zip-meta f)
         eo-cdr (:end-of-cdr-record meta)
         locals (:local-records meta)
         cdrs   (:cdr-records meta)
         extra  (long (:extra-bytes meta))
-        crc-fail (when verify-crcs
+        crc-fail (when check-crcs?
                    (->> (verify-crcs f)
                         (filter #(contains? #{:mismatch :error} (:status %)))
                         seq))

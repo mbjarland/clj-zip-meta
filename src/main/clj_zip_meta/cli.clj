@@ -76,6 +76,24 @@
   [n]
   (if (number? n) (format "%,d" (long n)) (str n)))
 
+;; ANSI-aware width / padding. format's "%-Ns" counts the escape codes,
+;; so a colored "ok" appears wider than a plain "empty" and the
+;; columns drift. visible / vlen / pad-left / pad-right operate on the
+;; *visible* length only.
+
+(def ^:private ansi-re #"\[[0-9;]*m")
+
+(defn- visible [s] (str/replace (str s) ansi-re ""))
+(defn- vlen    [s] (count (visible s)))
+
+(defn- pad-right [s w]
+  (let [s (str s) n (- w (vlen s))]
+    (if (pos? n) (str s (apply str (repeat n \space))) s)))
+
+(defn- pad-left [s w]
+  (let [s (str s) n (- w (vlen s))]
+    (if (pos? n) (str (apply str (repeat n \space)) s) s)))
+
 (defn- path-short
   "Trim a file path for display: keep filename only when run in a
   modern terminal, full path in JSON output."
@@ -95,16 +113,17 @@
 
 (defn- numeric? [v]
   (or (number? v)
-      (and (string? v) (re-matches #"-?\d+(?:,\d{3})*" v))))
+      (and (string? v) (re-matches #"-?\d+(?:,\d{3})*" (visible v)))))
 
 (defn- max-width [strs]
-  (apply max 0 (map #(count (str %)) strs)))
+  (apply max 0 (map vlen strs)))
 
 (defn- kv-block
   "Print a block of `[label value]` pairs with consistent
   alignment. Numeric values are right-aligned when the entire block
-  is numeric; otherwise values are left-aligned. Pairs whose value
-  is nil are skipped."
+  is numeric; otherwise values are left-aligned. ANSI-aware: colour
+  codes in labels or values don't break column widths. Pairs whose
+  value is nil are skipped."
   ([pairs] (kv-block 2 pairs))
   ([indent pairs]
    (let [pairs    (remove (fn [[_ v]] (nil? v)) pairs)
@@ -115,38 +134,44 @@
          vw       (when all-num? (max-width vals))
          pad      (apply str (repeat indent \space))]
      (doseq [[l v] pairs]
-       (let [vs (str v)]
+       (let [ls (str l) vs (str v)]
          (if all-num?
-           (println (format (str pad "%-" lw "s  %" vw "s") l vs))
-           (println (format (str pad "%-" lw "s  %s")       l vs))))))))
+           (println (str pad (pad-right ls lw) "  " (pad-left vs vw)))
+           (println (str pad (pad-right ls lw) "  " vs))))))))
 
 (defn- print-table
   "Print a table with `headers` and `rows`. Numeric columns
   right-align, text columns left-align. Header row is dim, separator
-  is a light horizontal rule."
+  is a light horizontal rule. ANSI-aware: colour codes don't break
+  column widths."
   [headers rows]
   (let [ncols     (count headers)
         col-vals  (mapv (fn [i] (map #(nth % i) rows)) (range ncols))
         col-num?  (mapv (fn [vs] (and (seq vs) (every? #(or (nil? %) (number? %)) vs))) col-vals)
+        cell-str  (fn [v n?]
+                    (cond
+                      (nil? v) ""
+                      n?       (fmt-num v)
+                      :else    (str v)))
         widths    (mapv (fn [i]
-                          (apply max (count (str (nth headers i)))
-                                 (map #(count (str (or (nth % i) ""))) rows)))
+                          (apply max (vlen (str (nth headers i)))
+                                 (map #(vlen (cell-str (nth % i) (nth col-num? i))) rows)))
                         (range ncols))
-        cell-fmt  (mapv (fn [w n?] (if n? (str "%" w "s") (str "%-" w "s")))
-                        widths col-num?)
-        hdr-fmt   (->> widths (map #(str "%-" % "s")) (str/join "  "))
-        row-fmt   (str/join "  " cell-fmt)
-        rule      (str/join "  " (map #(apply str (repeat % \─)) widths))]
-    (println (dim (apply format hdr-fmt (map str headers))))
-    (println (dim rule))
+        join-row  (fn [cells] (str/join "  " cells))
+        pad-cell  (fn [v w n?] (if n? (pad-left v w) (pad-right v w)))]
+    ;; Header row: always left-aligned.
+    (println (dim (join-row (map #(pad-right (str (nth headers %)) (nth widths %))
+                                  (range ncols)))))
+    ;; Separator rule
+    (println (dim (join-row (map #(apply str (repeat (nth widths %) \─))
+                                  (range ncols)))))
     (doseq [r rows]
-      (println (apply format row-fmt
-                      (map (fn [v n?]
-                             (cond
-                               (nil? v) ""
-                               n?       (fmt-num v)
-                               :else    (str v)))
-                           r col-num?))))))
+      (println (join-row
+                 (map (fn [i]
+                        (pad-cell (cell-str (nth r i) (nth col-num? i))
+                                  (nth widths i)
+                                  (nth col-num? i)))
+                      (range ncols)))))))
 
 (defn- status-line
   "Print a trailing OK / FAILED line. `text` defaults to the verdict
@@ -319,20 +344,22 @@
                   shown  (concat (filter counts order)
                                  (remove (set order) (keys counts)))
                   rows   (for [k shown] [(name k) (get counts k 0)])
-                  lw     (max-width (map first rows))
-                  vw     (max-width (map #(fmt-num (second %)) rows))]
+                  colorize (fn [k]
+                             (case k
+                               "ok"                 (green k)
+                               "mismatch"           (red   k)
+                               "error"              (red   k)
+                               "unsupported-method" (yellow k)
+                               k))
+                  lw     (max 5 (max-width (map first rows)))     ; "total" min
+                  vw     (max-width (cons (fmt-num (:total s))
+                                          (map #(fmt-num (second %)) rows)))]
               (doseq [[k n] rows]
-                (let [colored (case k
-                                "ok"        (green k)
-                                "mismatch"  (red   k)
-                                "error"     (red   k)
-                                "unsupported-method" (yellow k)
-                                k)]
-                  (println (format (str "  %-" lw "s  %" vw "s")
-                                   colored (fmt-num n)))))
-              (println (str "  " (apply str (repeat (+ lw 2 vw) \─))))
-              (println (format (str "  %-" lw "s  %" vw "s")
-                               (bold "total") (fmt-num (:total s)))))
+                (println (str "  " (pad-right (colorize k) lw)
+                              "  " (pad-left (fmt-num n) vw))))
+              (println (str "  " (dim (apply str (repeat (+ lw 2 vw) \─)))))
+              (println (str "  " (pad-right (bold "total") lw)
+                            "  " (pad-left (fmt-num (:total s)) vw))))
             (when (seq (:mismatches s))
               (subtitle "mismatches")
               (doseq [m (:mismatches s)]
@@ -340,8 +367,7 @@
             (when (seq (:errors s))
               (subtitle "errors")
               (doseq [m (:errors s)]
-                (println (format "  %s %s -- %s"
-                                 (red "•") (:file-name m) (:error m)))))
+                (println (str "  " (red "•") " " (:file-name m) " -- " (:error m)))))
             (status-line (:valid? s)))
           s)
     (when-not (:valid? s) (System/exit 1))))
@@ -390,21 +416,24 @@
             (fn []
               (title "inspect" f)
               (subtitle entry-name)
-              (let [fmt-attrs (fn [s] (if (seq s)
+              (let [or-none  (fn [v]
+                               (if (or (nil? v) (and (string? v) (str/blank? v)))
+                                 (dim "(none)") v))
+                    fmt-attrs (fn [s] (if (seq s)
                                         (str/join " " (map name s))
                                         (dim "(none)")))
-                    fmt-mode  (fn [m] (when m (format "%d (0o%o)" m m)))]
+                    fmt-mode  (fn [m]
+                                (if m (format "%d (0o%o)" m m)
+                                      (dim "(none)")))]
                 (kv-block
                   [["file-name"          (:file-name e)]
-                   ["file-comment"
-                    (let [c (:file-comment e)]
-                      (if (str/blank? c) (dim "(none)") c))]
+                   ["file-comment"       (or-none (:file-comment e))]
                    ["compressed-size"    (fmt-num (:compressed-size e))]
                    ["uncompressed-size"  (fmt-num (:uncompressed-size e))]
                    ["compression-method" (:compression-method e)]
                    ["crc-32"             (:crc-32 e)]
                    ["offset"             (fmt-num (:offset e))]
-                   ["last-modified"      (:last-modified e)]
+                   ["last-modified"      (or-none (:last-modified e))]
                    ["directory?"         (:directory? e)]
                    ["symlink?"           (:symlink? e)]
                    ["encrypted?"         (:encrypted? e)]
@@ -534,19 +563,20 @@
     (emit json?
           (fn []
             (println (bold (str "duplicate-classes  "
-                                (count jars) " jars")))
+                                (fmt-num (count jars)) " jars")))
             (println)
             (if (empty? m)
-              (do (println (green "OK") (dim " — no duplicate classes")))
-              (do (println (red (str (fmt-num (count m))
-                                     " duplicate class(es)")))
-                  (println)
-                  (doseq [[cls jars] m]
-                    (println (cyan cls))
-                    (doseq [j jars]
-                      (println (str "  " (path-short j)
-                                    "  " (dim j)))))
-                  (println))))
+              (println (str (green "OK") (dim " — no duplicate classes")))
+              (let [all-jars  (distinct (mapcat val m))
+                    short-w   (apply max 0 (map #(vlen (path-short %)) all-jars))]
+                (println (red (str (fmt-num (count m))
+                                   " duplicate class(es)")))
+                (println)
+                (doseq [[cls jars] m]
+                  (println (cyan cls))
+                  (doseq [j jars]
+                    (println (str "  " (pad-right (path-short j) short-w)
+                                  "  " (dim j))))))))
           m)
     (when (seq m) (System/exit 2))))
 
@@ -559,13 +589,16 @@
 (defn- analyze-cmd [f flags json?]
   (let [recursive? (contains? (set flags) "--recursive")
         r          (za/analyze f)
-        nested     (when recursive? (za/analyze-nested f))]
+        nested     (when recursive? (za/analyze-nested f))
+        nested-safe? (or (nil? nested)
+                         (every? #(get-in % [:analysis :safe?] true) nested))
+        overall-safe? (and (:safe? r) nested-safe?)]
     (emit json?
           (fn []
             (title "analyze" f)
             (println)
             (kv-block
-              [["safe?"        (if (:safe? r) (green "yes") (red "no"))]
+              [["safe?"        (if overall-safe? (green "yes") (red "no"))]
                ["file size"    (fmt-num (:file-size r))]
                ["entries"      (fmt-num (:entry-count r))]
                ["zip64?"       (if (:zip64? r) (yellow "yes") "no")]])
@@ -614,9 +647,9 @@
                                    (red "!")
                                    (:file-name e)
                                    (dim (str/join ", " (map name rs))))))))
-            (status-line (:safe? r) (if (:safe? r) "SAFE" "UNSAFE")))
+            (status-line overall-safe? (if overall-safe? "SAFE" "UNSAFE")))
           (cond-> r recursive? (assoc :nested nested)))
-    (when-not (:safe? r) (System/exit 1))))
+    (when-not overall-safe? (System/exit 1))))
 
 (defn- diff-cmd [a b json?]
   (let [d (zm/diff a b)]
@@ -635,34 +668,33 @@
                                 (if (zero? (count removed)) n (red n)))]
                  ["changed"   (let [n (fmt-num (count changed))]
                                 (if (zero? (count changed)) n (yellow n)))]])
-              (when (seq added)
-                (subtitle (str "added (" (count added) ")"))
-                (doseq [e added]
-                  (println (format "  %s %14s  %s"
-                                   (green "+")
-                                   (fmt-num (:uncompressed-size e))
-                                   (:file-name e)))))
-              (when (seq removed)
-                (subtitle (str "removed (" (count removed) ")"))
-                (doseq [e removed]
-                  (println (format "  %s %14s  %s"
-                                   (red "-")
-                                   (fmt-num (:uncompressed-size e))
-                                   (:file-name e)))))
+              (let [size-w (apply max 1
+                                   (map #(vlen (fmt-num (:uncompressed-size %)))
+                                        (concat added removed)))]
+                (when (seq added)
+                  (subtitle (str "added (" (count added) ")"))
+                  (doseq [e added]
+                    (println (str "  " (green "+") " "
+                                  (pad-left (fmt-num (:uncompressed-size e)) size-w)
+                                  "  " (:file-name e)))))
+                (when (seq removed)
+                  (subtitle (str "removed (" (count removed) ")"))
+                  (doseq [e removed]
+                    (println (str "  " (red "-") " "
+                                  (pad-left (fmt-num (:uncompressed-size e)) size-w)
+                                  "  " (:file-name e))))))
               (when (seq changed)
                 (subtitle (str "changed (" (count changed) ")"))
                 (doseq [{:keys [file-name before after]} changed]
-                  (println (str "  " (yellow "~ ") file-name))
-                  (println (format "      %s csize=%s usize=%s crc=%s"
-                                   (dim "before:")
-                                   (fmt-num (:compressed-size before))
-                                   (fmt-num (:uncompressed-size before))
-                                   (:crc-32 before)))
-                  (println (format "      %s csize=%s usize=%s crc=%s"
-                                   (dim "after: ")
-                                   (fmt-num (:compressed-size after))
-                                   (fmt-num (:uncompressed-size after))
-                                   (:crc-32 after)))))
+                  (println (str "  " (yellow "~") " " file-name))
+                  (println (str "      " (dim "before:")
+                                " csize=" (fmt-num (:compressed-size before))
+                                " usize=" (fmt-num (:uncompressed-size before))
+                                " crc="   (:crc-32 before)))
+                  (println (str "      " (dim "after: ")
+                                " csize=" (fmt-num (:compressed-size after))
+                                " usize=" (fmt-num (:uncompressed-size after))
+                                " crc="   (:crc-32 after)))))
               (when (zero? total-changes)
                 (println)
                 (println (green "identical")))))
@@ -717,10 +749,12 @@
         [cmd file & rest] args
         tty?     (some? (System/console))
         term     (System/getenv "TERM")]
-    (binding [*color?* (and (not json?)
-                            (not no-col?)
-                            tty?
-                            (not= "dumb" term))]
+    (binding [*color?* (or (and (not json?) (not no-col?)
+                                (= "1" (System/getenv "CLICOLOR_FORCE")))
+                           (and (not json?)
+                                (not no-col?)
+                                tty?
+                                (not= "dumb" term)))]
       (case cmd
         "list"     (list-cmd file rest json?)
         "tree"     (tree-cmd file rest json?)
