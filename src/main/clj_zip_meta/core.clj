@@ -420,9 +420,67 @@
                 (recur pos (rest kws))))))))
     (catch Exception _ nil)))
 
+(defn- filetime->ldt
+  "Convert a Windows FILETIME (100-ns ticks since 1601-01-01 UTC) to
+  a UTC LocalDateTime. Returns nil for non-positive inputs."
+  [^long filetime]
+  (when (pos? filetime)
+    (try
+      (let [millis (- (quot filetime 10000) 11644473600000)]
+        (-> (java.time.Instant/ofEpochMilli millis)
+            (.atZone java.time.ZoneOffset/UTC)
+            (.toLocalDateTime)))
+      (catch Exception _ nil))))
+
+(defn- decode-ntfs
+  "NTFS extra-field (tag 0x000A): 4 reserved bytes, then a sequence
+  of `tag(2) size(2) data(size)` sub-records. The interesting one
+  (tag 0x0001) carries the three NTFS timestamps as Windows FILETIME
+  values."
+  [^bytes data]
+  (try
+    (when (>= (alength data) 4)
+      (let [bb (-> (ByteBuffer/wrap data) (.order ByteOrder/LITTLE_ENDIAN))]
+        (loop [pos 4
+               acc {}]
+          (if (> (+ pos 4) (alength data))
+            (when (seq acc) acc)
+            (let [tag  (bit-and 0xFFFF (long (.getShort bb (int pos))))
+                  size (bit-and 0xFFFF (long (.getShort bb (int (+ pos 2)))))
+                  end  (+ pos 4 size)]
+              (if (> end (alength data))
+                (when (seq acc) acc)
+                (recur end
+                       (if (and (= tag 0x0001) (>= size 24))
+                         (let [mtime (.getLong bb (int (+ pos 4)))
+                               atime (.getLong bb (int (+ pos 12)))
+                               ctime (.getLong bb (int (+ pos 20)))]
+                           (cond-> acc
+                             (pos? mtime) (assoc :mtime (filetime->ldt mtime))
+                             (pos? atime) (assoc :atime (filetime->ldt atime))
+                             (pos? ctime) (assoc :ctime (filetime->ldt ctime))))
+                         acc))))))))
+    (catch Exception _ nil)))
+
+(defn- decode-pkware-unix
+  "PKWARE Unix extra-field (tag 0x000D): atime + mtime as Unix
+  timestamps, then UID and GID. Both timestamps are signed 32-bit
+  Unix seconds-since-epoch values."
+  [^bytes data]
+  (try
+    (when (>= (alength data) 12)
+      (let [bb (-> (ByteBuffer/wrap data) (.order ByteOrder/LITTLE_ENDIAN))]
+        {:atime (.getInt bb 0)
+         :mtime (.getInt bb 4)
+         :uid   (bit-and 0xFFFF (long (.getShort bb 8)))
+         :gid   (bit-and 0xFFFF (long (.getShort bb 10)))}))
+    (catch Exception _ nil)))
+
 (defn- decode-extra-field [tag ^bytes data]
   (case tag
     :extended-timestamp (decode-extended-timestamp data)
+    :ntfs               (decode-ntfs data)
+    :pkware-unix        (decode-pkware-unix data)
     nil))
 
 (defn- parse-extra-fields
@@ -457,14 +515,16 @@
         eattr  (long (:external-file-attributes cdr))
         vmade  (long (:version-made-by cdr))
         name   (:file-name cdr)
-        dattrs (dos-attrs eattr)]
+        dattrs (dos-attrs eattr)
+        mode   (unix-mode-from vmade eattr)]
     (assoc cdr
       :last-modified    (dos->ldt (long (:last-mod-file-date cdr))
                                   (long (:last-mod-file-time cdr)))
       :dos-attributes   dattrs
-      :unix-mode        (unix-mode-from vmade eattr)
+      :unix-mode        mode
       :directory?       (or (contains? dattrs :directory)
                             (and (string? name) (str/ends-with? name "/")))
+      :symlink?         (boolean (and mode (= 0120000 (bit-and 0170000 (long mode)))))
       :encrypted?       (pos? (bit-and gp 0x0001))
       :utf8-name?       (pos? (bit-and gp 0x0800))
       :extra-fields     (parse-extra-fields (:extra-field cdr)))))
@@ -1246,6 +1306,7 @@
                      :compression-method (:compression-method cdr)
                      :offset             offset
                      :directory?         (:directory? cdr)
+                     :symlink?           (:symlink? cdr)
                      :encrypted?         (:encrypted? cdr)
                      :last-modified      (:last-modified cdr)
                      :unix-mode          (:unix-mode cdr)
