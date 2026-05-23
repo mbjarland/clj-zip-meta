@@ -28,6 +28,8 @@
     "  jar-info  FILE                    High-level jar info (Main-Class, version, …)"
     "  describe  FILE                    What is this jar? (manifest + pom + counts)"
     "  classes   FILE                    .class entries grouped by Java package"
+    "  spi       FILE                    META-INF/services providers (SPI)"
+    "  duplicate-classes FILE FILE ...   Class names declared by more than one jar"
     "  cat       FILE ENTRY              Extract one entry to stdout"
     "  meta      FILE                    Pretty-print the full metadata map"
     "  summary   FILE                    Print a high-level summary"
@@ -308,6 +310,29 @@
               (doseq [c cs] (println (str "  " c)))))
           idx)))
 
+(defn- spi-cmd [f json?]
+  (let [m (zm/spi-providers f)]
+    (emit json?
+          (fn []
+            (if (empty? m)
+              (println "no META-INF/services entries")
+              (doseq [[iface impls] m]
+                (println iface)
+                (doseq [c impls] (println (str "  " c))))))
+          m)))
+
+(defn- duplicate-classes-cmd [jars json?]
+  (let [m (zm/duplicate-classes jars)]
+    (emit json?
+          (fn []
+            (if (empty? m)
+              (println "no duplicate classes across these jars")
+              (doseq [[cls jars] m]
+                (println cls)
+                (doseq [j jars] (println (str "  " j))))))
+          m)
+    (when (seq m) (System/exit 2))))
+
 (defn- cat-cmd [f entry-name]
   (if-let [ba (zm/extract-bytes f entry-name)]
     (.write (System/out) ^bytes ba)
@@ -442,6 +467,8 @@
       "jar-info" (jar-info-cmd file json?)
       "describe" (describe-cmd file json?)
       "classes"  (classes-cmd file json?)
+      "spi"      (spi-cmd file json?)
+      "duplicate-classes" (duplicate-classes-cmd (cons file rest) json?)
       "cat"      (cat-cmd file (first rest))
       (do (println usage)
           (flush)

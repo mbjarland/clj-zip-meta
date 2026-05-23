@@ -491,6 +491,58 @@
     (is (zero? (:class-count d)))
     (is (= ["src/"] (:top-level-dirs d)))))
 
+(deftest spi-providers-parses-services
+  (let [tmp (doto (File/createTempFile "spi-" ".jar") (.deleteOnExit))]
+    (with-open [out (ZipOutputStream. (FileOutputStream. tmp))]
+      (doseq [[name content]
+              {"META-INF/services/java.util.spi.LocaleNameProvider"
+               "# header comment\ncom.example.LocaleA\ncom.example.LocaleB\n"
+               "META-INF/services/com.example.Foo"
+               "com.example.FooImpl\n"
+               "META-INF/services/com.example.Bar"
+               "\n   \n# only comments\n"}]
+        (let [bs (.getBytes ^String content "UTF-8")
+              crc (doto (CRC32.) (.update bs))
+              entry (doto (ZipEntry. ^String name)
+                      (.setMethod ZipEntry/STORED)
+                      (.setSize (alength bs))
+                      (.setCompressedSize (alength bs))
+                      (.setCrc (.getValue crc)))]
+          (.putNextEntry out entry)
+          (.write out bs)
+          (.closeEntry out))))
+    (let [providers (zm/spi-providers (.getAbsolutePath tmp))]
+      (is (= ["com.example.LocaleA" "com.example.LocaleB"]
+             (get providers "java.util.spi.LocaleNameProvider")))
+      (is (= ["com.example.FooImpl"] (get providers "com.example.Foo")))
+      (is (= [] (get providers "com.example.Bar"))))))
+
+(deftest duplicate-classes-finds-conflicts
+  ;; Build two jars that share a class.
+  (let [make-jar (fn [path entries]
+                   (with-open [out (ZipOutputStream. (FileOutputStream. (jio/file path)))]
+                     (doseq [name entries]
+                       (let [bs (byte-array 4)
+                             crc (doto (CRC32.) (.update bs))
+                             entry (doto (ZipEntry. ^String name)
+                                     (.setMethod ZipEntry/STORED)
+                                     (.setSize 4)
+                                     (.setCompressedSize 4)
+                                     (.setCrc (.getValue crc)))]
+                         (.putNextEntry out entry)
+                         (.write out bs)
+                         (.closeEntry out))))
+                   path)
+        a (make-jar (.getAbsolutePath (doto (File/createTempFile "dup-a-" ".jar")
+                                        (.deleteOnExit)))
+                    ["com/x/Foo.class" "com/x/Bar.class"])
+        b (make-jar (.getAbsolutePath (doto (File/createTempFile "dup-b-" ".jar")
+                                        (.deleteOnExit)))
+                    ["com/x/Foo.class" "com/y/Quux.class"])
+        m (zm/duplicate-classes [a b])]
+    (is (= ["com.x.Foo"] (vec (keys m))))
+    (is (= 2 (count (get m "com.x.Foo"))))))
+
 (deftest hexdump-renders-classic-layout
   (let [s (zm/hexdump good-file 0 32)]
     (is (re-find #"^00000000  50 4b" s))

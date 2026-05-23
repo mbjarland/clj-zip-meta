@@ -40,11 +40,24 @@ and the format of [keepachangelog.com](https://keepachangelog.com/).
   for Spring Boot fat jars, uberjars-of-uberjars, and any payload
   that ships archives as entries.
 
+### Added — classpath investigation
+- `spi-providers` — parse `META-INF/services/*` and return a
+  sorted map of `service-interface -> [impl-class …]`. Tells you
+  what services a jar contributes to a JVM without loading it.
+- `duplicate-classes` — given a collection of jar paths, find
+  class names declared by more than one jar. The most common
+  cause of mysterious `LinkageError` / `NoSuchMethodError` at
+  runtime is two jars on the classpath that define different
+  versions of the same class.
+
 ### Added — CLI
 - `manifest FILE`         — pretty-print the manifest.
 - `jar-info FILE`         — pretty-print distilled jar fields.
 - `describe FILE`         — single-shot jar summary.
 - `classes  FILE`         — class index grouped by package.
+- `spi      FILE`         — `META-INF/services/*` providers.
+- `duplicate-classes FILE FILE …` — find shared class names across
+  jars (exits 2 if any duplicate found).
 - `cat FILE ENTRY`        — write one entry to stdout.
 - `analyze FILE --recursive` — walk nested archives.
 

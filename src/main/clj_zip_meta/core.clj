@@ -1908,6 +1908,64 @@
             (get props "artifactId") (assoc :artifact-id (get props "artifactId"))
             (get props "version")    (assoc :version     (get props "version"))))))))
 
+(defn spi-providers
+  "For a jar, parse every entry under `META-INF/services/` and return
+  a map of `service-interface-name -> sorted-vector-of-impl-classes`.
+  The Java SPI (Service Provider Interface) mechanism uses these
+  files to declare which classes in a jar implement which interfaces;
+  reading them tells you what a jar contributes to a JVM without
+  actually loading it.
+
+  Returns an empty map if the jar has no SPI entries.
+
+  Files are read as UTF-8. Per the SPI spec each line is a class
+  name; blank lines and `#` comments are ignored."
+  [f]
+  (let [services (filter
+                   (fn [{:keys [file-name] :as e}]
+                     (and (not (:directory? e))
+                          (str/starts-with? file-name "META-INF/services/")
+                          (not= "META-INF/services/" file-name)))
+                   (zip-entries f))
+        parse    (fn [text]
+                   (->> (str/split-lines text)
+                        (map #(str/replace % #"#.*$" ""))
+                        (map str/trim)
+                        (remove str/blank?)
+                        sort
+                        vec))]
+    (into (sorted-map)
+          (for [e services
+                :let [iface (subs (:file-name e) (count "META-INF/services/"))
+                      text  (extract-string f (:file-name e))]
+                :when text]
+            [iface (parse text)]))))
+
+(defn duplicate-classes
+  "Given a collection of jar paths, find class names that are
+  declared in more than one jar. Returns a map of fully-qualified
+  class name -> sorted vector of jar paths containing it.
+
+  Catches the most common cause of mysterious `NoSuchMethodError` /
+  `LinkageError` at runtime: two jars on the classpath define
+  different versions of the same class, and which one wins depends
+  on classpath ordering.
+
+  Only checks `.class` entries; signatures and SPI conflicts are
+  separate questions."
+  [jars]
+  (let [by-class (atom {})]
+    (doseq [jar jars
+            [pkg classes] (class-index jar)
+            cls           classes
+            :let [fqn (if (empty? pkg) cls (str pkg "." cls))]]
+      (swap! by-class update fqn (fnil conj []) (str jar)))
+    (into (sorted-map)
+          (keep (fn [[k vs]]
+                  (when (> (count vs) 1)
+                    [k (vec (sort (distinct vs)))]))
+                @by-class))))
+
 (defn describe
   "High-level \"what is this archive?\" summary. Combines
   `summarize`, `jar-info`, `pom-info`, and a class / resource count
