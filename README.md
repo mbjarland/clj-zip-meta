@@ -26,6 +26,15 @@ data; for that, use `java.util.zip.ZipFile` or libraries built on it.
   added / removed / changed (CRC or size).
 * `hexdump` — render the bytes around a record offset as a classic
   hex dump for repair investigations.
+* `layout` — describe / visualize where every record physically
+  lives in the archive (preamble, LFH, data, optional data
+  descriptor, CDR, EOCDR, gaps).
+* `largest`, `smallest`, `newest`, `oldest`, `group-by-dir`,
+  `compression-stats` — analytical helpers for asking "what's in
+  here?"
+* `clj-zip-meta.analysis/analyze` — forensic check: zip-slip
+  paths, zip-bomb compression ratios, gap data, CDR/LFH
+  mismatches, Zip64 detection.
 * `zip-comment` / `set-zip-comment!` — read or rewrite the archive
   comment.
 * `summarize` — high-level statistics in a single map.
@@ -220,6 +229,59 @@ in the central directory. It supports the STORED (0) and DEFLATE
 This is the strongest integrity check the library performs — it
 verifies the data itself, not just the metadata.
 
+### Analyzing untrusted archives
+
+Before extracting an archive you didn't build yourself, run the
+forensics suite:
+
+```clojure
+(require '[clj-zip-meta.analysis :as za])
+
+(za/analyze "downloaded.zip")
+;;=> {:safe? false
+;;    :file-size 1024
+;;    :entry-count 2
+;;    :zip64? false
+;;    :unsafe-entries
+;;     [{:entry {:file-name "../etc/passwd" ...}
+;;       :reasons #{:path-traversal}}]
+;;    :zip-bomb-risks []
+;;    :gap-data []
+;;    :cdr-lfh-mismatches []}
+```
+
+This checks for:
+- **Zip-slip paths** — `../` traversal, absolute paths, null bytes,
+  Windows reserved names, control characters.
+- **Zip-bomb ratios** — entries with extreme uncompressed /
+  compressed ratios (defaults to a 1000:1 threshold).
+- **Gap data** — byte ranges no record claims, a classic hiding
+  place for piggy-backed content.
+- **CDR / LFH mismatches** — entries whose central directory and
+  local file header disagree on critical fields, a known vector
+  for tool-confusion attacks.
+- **Zip64 sentinels** — the EOCDR uses sentinel values pointing to
+  Zip64 records this library does not yet parse.
+
+### Layout visualization
+
+When you need to understand the on-disk structure of an archive,
+`print-layout` renders the regions as a table with an optional
+ASCII byte-map:
+
+```
+$ lein run -- layout my.jar --width 60
+|PPPPPPPPPPPPPPPPPPPPPLLLLLLLLLLLLLLDDDDDDCCCCCCCCCCCCCCCCCEE|  15 bytes/char
+  P=preamble L=LFH D=data d=descriptor C=CDR E=EOCDR -=gap
+
+start            end              length     kind               file-name
+-----            ---              ------     ----               ---------
+0                317              317        preamble
+317              379              62         lfh                src/
+379              379              0          data               src/
+...
+```
+
 ### Repair
 
 Three repair strategies are available, each appropriate for a different
@@ -293,8 +355,13 @@ $ lein run -- repair   broken.jar [--strip]
 $ lein run -- comment  my.jar
 $ lein run -- comment  my.jar "new archive comment"
 $ lein run -- list     my.jar --match '\.class$'
+$ lein run -- tree     my.jar
+$ lein run -- inspect  my.jar META-INF/MANIFEST.MF
+$ lein run -- grep     my.jar 'foo/bar/'
 $ lein run -- diff     old.jar new.jar
+$ lein run -- layout   my.jar --width 80
 $ lein run -- hexdump  my.jar 2231 64
+$ lein run -- analyze  untrusted.zip
 ```
 
 Add `--json` to any read-only command for machine-readable output

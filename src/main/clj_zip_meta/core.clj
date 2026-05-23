@@ -1320,6 +1320,240 @@
   [f file-name]
   (some #(when (= (:file-name %) file-name) %) (zip-entries f)))
 
+;; ----------------------------------------------------------------------------
+;; Analytical helpers
+
+(defn- sort-entries-by [f n by descending?]
+  (->> (zip-entries f)
+       (filter #(some? (get % by)))
+       (sort-by by (if descending? #(compare %2 %1) compare))
+       (take n)
+       vec))
+
+(defn largest
+  "Return the top-`n` entries in `f` (default 10) by `:uncompressed-size`,
+  largest first. Override the ranking field with the `:by` option
+  (e.g. `{:by :compressed-size}`)."
+  ([f] (largest f 10 {}))
+  ([f n] (largest f n {}))
+  ([f n {:keys [by] :or {by :uncompressed-size}}]
+   (sort-entries-by f n by true)))
+
+(defn smallest
+  "Return the bottom-`n` entries in `f` by `:uncompressed-size`,
+  smallest first. Excludes directory entries (size 0). See `largest`
+  for options."
+  ([f] (smallest f 10 {}))
+  ([f n] (smallest f n {}))
+  ([f n {:keys [by] :or {by :uncompressed-size}}]
+   (->> (zip-entries f)
+        (remove :directory?)
+        (filter #(some? (get % by)))
+        (sort-by by)
+        (take n)
+        vec)))
+
+(defn newest
+  "Return the top-`n` entries in `f` by `:last-modified`, most-recent
+  first."
+  ([f] (newest f 10))
+  ([f n] (sort-entries-by f n :last-modified true)))
+
+(defn oldest
+  "Return the top-`n` entries in `f` by `:last-modified`,
+  oldest first."
+  ([f] (oldest f 10))
+  ([f n] (sort-entries-by f n :last-modified false)))
+
+(defn group-by-dir
+  "Group `f`'s entries by their parent directory (everything up to
+  and including the last `/`). Returns a map of `dir -> [entries]`.
+  Top-level entries (no `/`) are keyed under `\"\"`."
+  [f]
+  (group-by
+    (fn [e]
+      (let [^String n (:file-name e)
+            i (.lastIndexOf n (int \/))]
+        (if (neg? i) "" (subs n 0 (inc i)))))
+    (zip-entries f)))
+
+(defn- file-extension [^String n]
+  (let [i (.lastIndexOf n (int \.))
+        s (.lastIndexOf n (int \/))]
+    (when (and (pos? i) (> i s))
+      (subs n (inc i)))))
+
+(defn compression-stats
+  "Return a map describing how `f` compresses:
+
+    `:overall`        {:count N :uncompressed N :compressed N :ratio R}
+    `:by-method`      method-int -> stats map
+    `:by-extension`   ext-string -> stats map (top 20 by total
+                      uncompressed size; `nil` ext lumped under `:no-ext`)
+    `:worst-ratios`   top 10 entries by compression ratio (most
+                      compressed, i.e. uncompressed/compressed)
+
+  Directory entries are excluded from the totals."
+  [f]
+  (let [entries  (->> (zip-entries f) (remove :directory?))
+        ratio    (fn [u c] (when (pos? c) (double (/ (max 1 u) c))))
+        stats-for (fn [es]
+                    (let [u (reduce + 0 (map #(long (:uncompressed-size %)) es))
+                          c (reduce + 0 (map #(long (:compressed-size   %)) es))]
+                      {:count       (count es)
+                       :uncompressed u
+                       :compressed   c
+                       :ratio        (ratio u c)}))
+        by-meth  (->> entries
+                      (group-by :compression-method)
+                      (into {} (map (juxt key (comp stats-for val)))))
+        by-ext   (->> entries
+                      (group-by #(or (file-extension (:file-name %)) :no-ext))
+                      (into {} (map (juxt key (comp stats-for val))))
+                      (sort-by (comp - :uncompressed val))
+                      (take 20)
+                      (into {}))
+        worst    (->> entries
+                      (keep (fn [e]
+                              (when-let [r (ratio (:uncompressed-size e)
+                                                  (:compressed-size e))]
+                                (assoc e :compression-ratio r))))
+                      (sort-by (comp - :compression-ratio))
+                      (take 10)
+                      vec)]
+    {:overall      (stats-for entries)
+     :by-method    by-meth
+     :by-extension by-ext
+     :worst-ratios worst}))
+
+;; ----------------------------------------------------------------------------
+;; Layout visualization
+
+(defn layout
+  "Describe where each record physically lives in `f`. Returns a
+  vector of region maps, sorted by `:start`:
+
+    [{:kind :preamble :start 0 :end 317 :length 317}
+     {:kind :lfh   :start 317  :end 360 :file-name \"foo\"}
+     {:kind :data  :start 360  :end 372 :file-name \"foo\"}
+     {:kind :cdr   :start 372  :end 800}
+     {:kind :eocdr :start 800  :end 822}
+     {:kind :gap   :start 822  :end 900}]   ;; if file ends past EOCDR
+
+  Useful as the data source for a hex-editor-style visualization of
+  the archive. See `print-layout` for an ASCII rendering."
+  [f]
+  (let [m         (zip-meta f)
+        extra     (long (:extra-bytes m))
+        file-len  (.length (jio/file f))
+        cdr-recs  (mapv :record (:cdr-records m))
+        lfh-rs    (:local-records m)
+        cdr-by-fn (into {} (map (juxt :file-name identity)) cdr-recs)
+        eo        (:end-of-cdr-record m)
+        eo-rec    (:record eo)
+        cdr-start (+ (long (:cdr-offset-from-start-disk eo-rec)) extra)
+        cdr-size  (long (:cdr-size eo-rec))
+        eo-off    (long (:offset eo))
+        ^String cmt (or (:zip-comment eo-rec) "")
+        ^bytes cmt-bs (.getBytes cmt "UTF-8")
+        eo-end    (+ eo-off 22 (alength cmt-bs))
+        ;; Build LFH header + data regions
+        lfh-regs  (mapcat
+                    (fn [{lfh-off :offset lfh :record}]
+                      (let [hdr-size (+ 30
+                                        (long (:file-name-length lfh))
+                                        (long (:extra-field-length lfh)))
+                            cdr      (get cdr-by-fn (:file-name lfh))
+                            data-sz  (long (:compressed-size cdr))
+                            data-end (+ lfh-off hdr-size data-sz)
+                            dd?      (pos? (bit-and (long (:general-purpose lfh)) 0x8))
+                            dd-size  (if dd? 16 0) ;; assume with-sig (Java convention)
+                            after-dd (+ data-end dd-size)
+                            base     [{:kind :lfh
+                                       :start lfh-off
+                                       :end   (+ lfh-off hdr-size)
+                                       :length hdr-size
+                                       :file-name (:file-name lfh)}
+                                      {:kind :data
+                                       :start (+ lfh-off hdr-size)
+                                       :end   data-end
+                                       :length data-sz
+                                       :file-name (:file-name lfh)}]]
+                        (cond-> base
+                          dd? (conj {:kind :data-descriptor
+                                     :start data-end
+                                     :end   after-dd
+                                     :length dd-size
+                                     :file-name (:file-name lfh)}))))
+                    lfh-rs)
+        preamble  (when (pos? extra)
+                    [{:kind :preamble :start 0 :end extra :length extra}])
+        cdr-reg   {:kind :cdr :start cdr-start :end (+ cdr-start cdr-size)
+                   :length cdr-size :entries (count cdr-recs)}
+        eocdr-reg {:kind :eocdr :start eo-off :end eo-end
+                   :length (- eo-end eo-off)}
+        all       (concat preamble lfh-regs [cdr-reg eocdr-reg])
+        sorted    (sort-by :start all)
+        ;; Fill in gaps
+        with-gaps (loop [acc      []
+                         last-end (long 0)
+                         regs     sorted]
+                    (if (empty? regs)
+                      (cond-> acc
+                        (< last-end file-len)
+                        (conj {:kind :gap
+                               :start last-end
+                               :end file-len
+                               :length (- file-len last-end)}))
+                      (let [{:keys [start end] :as r} (first regs)
+                            acc' (cond-> acc
+                                   (> (long start) last-end)
+                                   (conj {:kind :gap
+                                          :start last-end
+                                          :end start
+                                          :length (- (long start) last-end)}))]
+                        (recur (conj acc' r)
+                               (long (max last-end (long end)))
+                               (rest regs)))))]
+    (vec with-gaps)))
+
+(defn print-layout
+  "Pretty-print the layout of `f` as a one-line-per-region table.
+  Pass `:width N` to also draw a width-`N` ASCII byte-map (each char
+  represents `file-size / N` bytes) above the table."
+  ([f] (print-layout f {}))
+  ([f {:keys [width] :or {width 0}}]
+   (let [regs   (layout f)
+         flen   (long (apply max (map :end regs)))
+         kchar  {:preamble        \P
+                 :lfh             \L
+                 :data            \D
+                 :data-descriptor \d
+                 :cdr             \C
+                 :eocdr           \E
+                 :gap             \-}]
+     (when (pos? width)
+       (let [bytes-per-char (max 1 (quot flen width))
+             cells          (char-array width \space)]
+         (doseq [r regs]
+           (let [s (quot (long (:start r)) bytes-per-char)
+                 e (max (inc s) (quot (long (:end r)) bytes-per-char))]
+             (loop [i s]
+               (when (< i (min width e))
+                 (aset-char cells i (get kchar (:kind r) \?))
+                 (recur (inc i))))))
+         (println (str "|" (String. cells) "|  "
+                       bytes-per-char " bytes/char"))
+         (println "  P=preamble L=LFH D=data d=descriptor C=CDR E=EOCDR -=gap")
+         (println)))
+     (printf "%-16s %-16s %-10s %-18s %s%n"
+             "start" "end" "length" "kind" "file-name")
+     (printf "%-16s %-16s %-10s %-18s %s%n"
+             "-----" "---" "------" "----" "---------")
+     (doseq [{:keys [start end length kind file-name]} regs]
+       (printf "%-16d %-16d %-10d %-18s %s%n"
+               start end length (name kind) (or file-name ""))))))
+
 (defn diff
   "Compare two archives by file-name. Returns a map describing the
   differences:

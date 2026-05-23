@@ -44,6 +44,49 @@ and the format of [keepachangelog.com](https://keepachangelog.com/).
   README, intro, changelog, and contributor guide as navigation
   entries on the published docs site.
 
+### Analytical helpers (core)
+- `largest`, `smallest`, `newest`, `oldest` — top-N entries ranked
+  by size or modification time.
+- `group-by-dir` — entries grouped by their parent directory.
+- `compression-stats` — overall, per-method, per-extension, and
+  worst-ratio compression statistics.
+
+### Layout visualization (core)
+- `layout f` — returns a vector describing every record's physical
+  byte range (`:preamble`, `:lfh`, `:data`, `:data-descriptor`,
+  `:cdr`, `:eocdr`, `:gap`).
+- `print-layout f {:width N}` — pretty-prints the regions as a
+  table, with an optional `N`-wide ASCII byte-map showing where
+  each region lives in the file:
+
+      |PPPPPPPPPPPPPPLLLLLLLLLLDDDDCCCCCCCCCCCC|  22 bytes/char
+        P=preamble L=LFH D=data d=descriptor C=CDR E=EOCDR -=gap
+
+### Forensics — new `clj-zip-meta.analysis` namespace
+- `unsafe-entries` — paths that would escape the extract directory
+  (zip-slip), have null bytes, absolute paths, Windows reserved
+  names, etc.
+- `zip-bomb-risk` — entries with extreme uncompressed-to-compressed
+  ratios.
+- `gap-data` — byte ranges not claimed by any record. A classic
+  hiding place for piggy-backed content.
+- `cdr-lfh-mismatches` — entries whose CDR and LFH disagree on
+  name, size, or CRC. A known vector for tool-confusion attacks.
+- `zip64?` — true when the EOCDR uses Zip64 sentinel values.
+  This library does not yet read the Zip64 records.
+- `analyze f` — runs all the above and returns a single safety
+  report with a `:safe?` flag.
+
+### CLI: tree, inspect, grep, layout, analyze
+- `tree FILE [--match PAT]` — show entries as a directory tree.
+- `inspect FILE ENTRY-NAME` — pretty-print everything we know
+  about one entry.
+- `grep FILE PATTERN` — list entry names matching a regex.
+- `layout FILE [--width N]` — pretty-print the physical layout
+  with an optional byte-map visualization.
+- `analyze FILE` — run the safety / forensics suite (exits 1
+  if the archive is not `:safe?`).
+
 ### Changed (breaking)
 - `read-spec-from-buffer`, `read-spec-from-file`,
   `write-spec-to-buffer!`, and `write-spec-to-file!` moved from

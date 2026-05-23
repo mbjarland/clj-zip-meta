@@ -4,7 +4,8 @@
   Run via `lein run -- COMMAND FILE [args...]` or `clj -M:cli --
   COMMAND FILE [args...]`. Pass `--json` to any read-only command to
   emit machine-readable JSON instead of human-readable text."
-  (:require [clj-zip-meta.core :as zm]
+  (:require [clj-zip-meta.analysis :as za]
+            [clj-zip-meta.core :as zm]
             [clojure.java.io :as jio]
             [clojure.pprint :as pp]
             [clojure.string :as str]
@@ -22,14 +23,19 @@
     ""
     "Commands:"
     "  list      FILE [--match PAT]      List entries; optional regex/substring filter"
+    "  tree      FILE [--match PAT]      Show entries as a directory tree"
     "  meta      FILE                    Pretty-print the full metadata map"
     "  summary   FILE                    Print a high-level summary"
+    "  inspect   FILE ENTRY-NAME         Pretty-print everything about one entry"
+    "  grep      FILE PATTERN            Print entry names matching PATTERN"
     "  comment   FILE [new-comment]      Print or set the archive comment"
     "  validate  FILE [--crc]            Check metadata (and optionally CRC-32)"
     "  verify    FILE                    Decompress every entry and check CRC-32"
     "  repair    FILE [--strip]          Repair offset drift or rebuild a missing CDR"
     "  diff      FILE-A FILE-B           Compare two archives by file-name + CRC"
+    "  layout    FILE [--width N]        Show the physical layout of records in FILE"
     "  hexdump   FILE OFFSET [LENGTH]    Dump bytes around a record offset"
+    "  analyze   FILE                    Run safety / forensics checks"
     ""
     "Global flags:"
     "  --json     Emit JSON on stdout instead of human-readable text"
@@ -178,6 +184,110 @@
           s)
     (when-not (:valid? s) (System/exit 1))))
 
+(defn- flag-value
+  "Find `--name` in `flags` and return its succeeding token, or
+  `default`."
+  [flags name default]
+  (loop [xs flags]
+    (cond
+      (empty? xs)         default
+      (= name (first xs)) (second xs)
+      :else               (recur (rest xs)))))
+
+(defn- tree-cmd [f flags json?]
+  (let [match  (flag-value flags "--match" nil)
+        match* (when match (try (re-pattern match) (catch Exception _ match)))
+        entries (zm/zip-entries f (cond-> {} match* (assoc :match match*)))
+        ;; Build a nested map: {part {part {... {nil :leaf-name}}}}.
+        tree    (reduce
+                  (fn [acc {:keys [file-name]}]
+                    (let [segs (str/split file-name #"/")
+                          last? #(= (count %) 1)
+                          path-vec (vec (butlast segs))
+                          leaf     (last segs)]
+                      (if (str/ends-with? file-name "/")
+                        (update-in acc (mapv #(str % "/") segs) #(or % (sorted-map)))
+                        (assoc-in acc (conj (mapv #(str % "/") path-vec) leaf) :file))))
+                  (sorted-map)
+                  entries)]
+    (emit json?
+          (fn []
+            (println f)
+            (letfn [(walk [node prefix]
+                      (let [ks (vec (keys node))]
+                        (doseq [[i k] (map-indexed vector ks)]
+                          (let [last?    (= i (dec (count ks)))
+                                marker   (if last? "└── " "├── ")
+                                continue (if last? "    " "│   ")
+                                v        (get node k)]
+                            (println (str prefix marker k))
+                            (when (map? v)
+                              (walk v (str prefix continue)))))))]
+              (walk tree "")))
+          tree)))
+
+(defn- inspect-cmd [f entry-name json?]
+  (let [e (zm/find-entry f entry-name)]
+    (if-not e
+      (do (println (str "no entry named " (pr-str entry-name)))
+          (System/exit 1))
+      (emit json?
+            (fn []
+              (doseq [k [:file-name :file-comment :compressed-size
+                         :uncompressed-size :crc-32 :compression-method
+                         :offset :directory? :symlink? :encrypted?
+                         :last-modified :unix-mode :dos-attributes]]
+                (println (format "%-22s %s" (str (name k) ":") (pr-str (get e k))))))
+            e))))
+
+(defn- grep-cmd [f pattern json?]
+  (let [re      (re-pattern pattern)
+        entries (zm/zip-entries f {:match re})]
+    (emit json?
+          (fn []
+            (doseq [e entries] (println (:file-name e))))
+          (mapv :file-name entries))))
+
+(defn- layout-cmd [f flags json?]
+  (let [w-arg (flag-value flags "--width" nil)
+        width (if w-arg (Long/parseLong w-arg) 0)]
+    (if json?
+      (do (println (->json (zm/layout f))) (flush))
+      (zm/print-layout f {:width width}))))
+
+(defn- analyze-cmd [f json?]
+  (let [r (za/analyze f)]
+    (emit json?
+          (fn []
+            (println (str "safe?:               " (:safe? r)))
+            (println (str "file-size:           " (:file-size r)))
+            (println (str "entry-count:         " (:entry-count r)))
+            (println (str "zip64?:              " (:zip64? r)))
+            (let [u (:unsafe-entries r)]
+              (println (str "unsafe-entries (" (count u) "):"))
+              (doseq [{:keys [entry reasons]} u]
+                (println (format "  %s -- %s"
+                                 (:file-name entry)
+                                 (str/join ", " (map name reasons))))))
+            (let [b (:zip-bomb-risks r)]
+              (println (str "zip-bomb-risks (" (count b) "):"))
+              (doseq [e (take 5 b)]
+                (println (format "  %.0f:1  %s"
+                                 (:compression-ratio e)
+                                 (:file-name e)))))
+            (let [g (:gap-data r)]
+              (println (str "gap-data (" (count g) "):"))
+              (doseq [{:keys [start end length]} g]
+                (println (format "  %d-%d  (%d bytes)" start end length))))
+            (let [m (:cdr-lfh-mismatches r)]
+              (println (str "cdr-lfh-mismatches (" (count m) "):"))
+              (doseq [{:keys [file-name differences]} m]
+                (println (format "  %s -- fields differ: %s"
+                                 file-name
+                                 (str/join ", " (map name (keys differences))))))))
+          r)
+    (when-not (:safe? r) (System/exit 1))))
+
 (defn- diff-cmd [a b json?]
   (let [d (zm/diff a b)]
     (emit json?
@@ -241,14 +351,19 @@
         [cmd file & rest] args]
     (case cmd
       "list"     (list-entries file rest json?)
+      "tree"     (tree-cmd file rest json?)
       "meta"     (print-meta file json?)
       "summary"  (print-summary file json?)
+      "inspect"  (inspect-cmd file (first rest) json?)
+      "grep"     (grep-cmd file (first rest) json?)
       "comment"  (comment-cmd file (first rest) json?)
       "validate" (validate-cmd file rest json?)
       "verify"   (verify-cmd file json?)
       "repair"   (repair-cmd file rest json?)
       "diff"     (diff-cmd file (first rest) json?)
+      "layout"   (layout-cmd file rest json?)
       "hexdump"  (hexdump-cmd file (first rest) (second rest) json?)
+      "analyze"  (analyze-cmd file json?)
       (do (println usage)
           (flush)
           (System/exit (if cmd 1 0))))))
