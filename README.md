@@ -54,13 +54,13 @@ zip tools; `clj-zip-meta` repairs it.
 Leiningen / Boot:
 
 ```clojure
-[clj-zip-meta/clj-zip-meta "0.3.0"]
+[clj-zip-meta/clj-zip-meta "0.4.0"]
 ```
 
 deps.edn:
 
 ```clojure
-clj-zip-meta/clj-zip-meta {:mvn/version "0.3.0"}
+clj-zip-meta/clj-zip-meta {:mvn/version "0.4.0"}
 ```
 
 The repo also ships a `deps.edn` with `:test`, `:cli`, and `:bench`
@@ -72,7 +72,28 @@ clj -M:cli -- list my.jar      # run the CLI
 clj -M:bench [PATH-TO-A-JAR]   # criterium benchmarks
 ```
 
-Requires Clojure 1.10+ and JDK 11+.
+### Babashka
+
+The high-level API (`clj-zip-meta.core`) and the CLI
+(`clj-zip-meta.cli`) run under [Babashka](https://babashka.org/) too.
+A `bb.edn` is bundled — clone the repo and:
+
+```
+bb -m clj-zip-meta.cli list my.jar
+bb -m clj-zip-meta.cli verify my.jar
+bb -m clj-zip-meta.cli repair my.jar
+```
+
+…or pull it in from another Babashka project:
+
+```clojure
+{:deps {clj-zip-meta/clj-zip-meta
+        {:git/url "https://github.com/mbjarland/clj-zip-meta"
+         :git/tag "v0.4.0"}}}
+```
+
+Requires Clojure 1.10+ and JDK 11+ for normal use, or Babashka 1.0+
+for the bb path.
 
 ## Library usage
 

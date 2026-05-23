@@ -1,0 +1,17 @@
+;; bb.edn — invoke clj-zip-meta from Babashka scripts.
+;;
+;; Usage from inside this repo:
+;;   bb -m clj-zip-meta.cli -- list my.jar
+;;
+;; To use as a dependency from another Babashka project, point to this
+;; repo via :local/root or :git/url in your own bb.edn:
+;;
+;;   {:deps {clj-zip-meta/clj-zip-meta
+;;           {:git/url "https://github.com/mbjarland/clj-zip-meta"
+;;            :git/tag "v0.4.0"}}}
+;;
+;; Note: the clj-zip-meta.spec and clj-zip-meta.spec-io namespaces are
+;; NOT Babashka-compatible because they depend on Octet. The
+;; high-level API in clj-zip-meta.core (and the CLI) work fine.
+
+{:paths ["src/main"]}

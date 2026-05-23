@@ -11,7 +11,7 @@
             [clojure.walk :as walk])
   (:gen-class))
 
-(def ^:private version "0.3.0")
+(def ^:private version "0.4.0")
 
 (def ^:private usage
   (str/join

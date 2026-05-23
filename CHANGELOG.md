@@ -6,6 +6,31 @@ and the format of [keepachangelog.com](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-23
+
+### Added
+- **Babashka compatibility.** The high-level API in
+  `clj-zip-meta.core` and the CLI (`clj-zip-meta.cli`) now run under
+  [Babashka](https://babashka.org/) — no JVM required. A `bb.edn` is
+  bundled. Try `bb -m clj-zip-meta.cli list my.jar`.
+
+### Changed (breaking)
+- `read-spec-from-buffer`, `read-spec-from-file`,
+  `write-spec-to-buffer!`, and `write-spec-to-file!` moved from
+  `clj-zip-meta.core` to a new namespace `clj-zip-meta.spec-io`.
+  These functions wrap Octet's `read` / `write!`, and Octet pulls in
+  `io.netty.buffer`, which Babashka doesn't ship. Isolating them in
+  their own namespace lets `clj-zip-meta.core` load anywhere.
+  Migration: replace `(require '[clj-zip-meta.core :as zm])` calls
+  to those four functions with `(require '[clj-zip-meta.spec-io :as
+  sio])` / `(sio/...)`.
+- The record signatures used internally are now byte-array constants
+  in `clj-zip-meta.core` rather than maps re-exported from
+  `clj-zip-meta.spec`. The maps in `clj-zip-meta.spec`
+  (`rec-cdr-header-sig`, etc.) remain for backwards compatibility.
+- `clj-zip-meta.core` no longer requires `clj-zip-meta.spec` or
+  Octet at namespace-load time.
+
 ## [0.3.0] - 2026-05-22
 
 ### Performance
@@ -125,7 +150,8 @@ and the format of [keepachangelog.com](https://keepachangelog.com/).
   local file headers from zip/jar files; repair offsets after prepending
   preamble bytes.
 
-[Unreleased]: https://github.com/mbjarland/clj-zip-meta/compare/0.3.0...HEAD
+[Unreleased]: https://github.com/mbjarland/clj-zip-meta/compare/0.4.0...HEAD
+[0.4.0]: https://github.com/mbjarland/clj-zip-meta/compare/0.3.0...0.4.0
 [0.3.0]: https://github.com/mbjarland/clj-zip-meta/compare/0.2.0...0.3.0
 [0.2.0]: https://github.com/mbjarland/clj-zip-meta/compare/0.1.3...0.2.0
 [0.1.3]: https://github.com/mbjarland/clj-zip-meta/compare/0.1.2...0.1.3

@@ -17,15 +17,7 @@
   or an already-open `java.io.RandomAccessFile`. See APPNOTE.TXT §4.3
   for the zip-format details that drive the field names this library
   returns."
-  (:require [clj-zip-meta.spec :refer [rec-local-file-header
-                                       rec-local-file-header-sig
-                                       rec-cdr-header
-                                       rec-cdr-header-sig
-                                       rec-end-of-cdr
-                                       rec-end-of-cdr-sig]]
-            [octet.core :as buf]
-            [octet.spec :as ospec]
-            [clojure.java.io :as jio]
+  (:require [clojure.java.io :as jio]
             [clojure.pprint :as pp]
             [clojure.string :as str]
             [clojure.walk :as walk])
@@ -95,8 +87,6 @@
          (finally
            (when close?# (.close ~tagged)))))))
 
-(defn- sig-bytes [rec-sig]
-  (first (vals rec-sig)))
 
 (defn- bytes-equal-at?
   [^bytes haystack ^long start ^bytes needle ^long nlen]
@@ -131,19 +121,18 @@
           i
           (recur (inc i)))))))
 
-(defn- read-spec-bb
-  "Read a record described by `spec` from `bb` at byte position `off`
-  (little-endian)."
-  [^ByteBuffer bb spec ^long off]
-  (buf/with-byte-order :little-endian
-    (buf/read bb spec {:offset off})))
+;; ----------------------------------------------------------------------------
+;; Signatures, mirrored from `clj-zip-meta.spec` so that namespace
+;; (which transitively pulls in Octet) is not required to load core.
 
-(defn- write-spec-bb!
-  "Write `data` matching `spec` into `bb` at byte position `off`
-  (little-endian)."
-  [^ByteBuffer bb data spec ^long off]
-  (buf/with-byte-order :little-endian
-    (buf/write! bb data spec {:offset off})))
+(def ^:private ^{:tag "[B"} lfh-sig-bytes
+  (byte-array [(byte 0x50) (byte 0x4b) (byte 0x03) (byte 0x04)]))
+
+(def ^:private ^{:tag "[B"} cdr-sig-bytes
+  (byte-array [(byte 0x50) (byte 0x4b) (byte 0x01) (byte 0x02)]))
+
+(def ^:private ^{:tag "[B"} eocdr-sig-bytes
+  (byte-array [(byte 0x50) (byte 0x4b) (byte 0x05) (byte 0x06)]))
 
 ;; ----------------------------------------------------------------------------
 ;; Hand-rolled fast readers.
@@ -589,40 +578,14 @@
           buf      (byte-array win-size)]
       (.seek r win-off)
       (.readFully r buf)
-      (when-let [idx (last-index-of-bytes buf (sig-bytes rec-end-of-cdr-sig))]
+      (when-let [idx (last-index-of-bytes buf eocdr-sig-bytes)]
         (+ win-off (long idx))))))
 
-(defn read-spec-from-buffer
-  "Read a single record matching `spec` from `ByteBuffer` `buff` at
-  byte position `off`. Always little-endian."
-  [buff spec off]
-  (read-spec-bb buff spec (long off)))
-
-(defn read-spec-from-file
-  "Read a single record matching `spec` from `f` at byte offset `off`.
-  Always little-endian."
-  [f spec off]
-  {:pre [(valid-offset? off)]}
-  (with-raf [r f "r"]
-    (let [bb (map-region r "r" (long off) (- (.length r) (long off)))]
-      (read-spec-bb bb spec 0))))
-
-(defn write-spec-to-buffer!
-  "Write `data` matching `spec` to `ByteBuffer` `buff` at byte
-  position `off`. Always little-endian."
-  [buff data spec off]
-  (write-spec-bb! buff data spec (long off)))
-
-(defn write-spec-to-file!
-  "Write `data` matching `spec` to file `f` at byte offset `off`.
-  Always little-endian. The file must already be at least large
-  enough to hold the record."
-  [f data spec off]
-  {:pre [(valid-offset? off)]}
-  (with-raf [r f "rw"]
-    (let [bb (map-region r "rw" (long off) (- (.length r) (long off)))]
-      (write-spec-bb! bb data spec 0)
-      (.force ^MappedByteBuffer bb))))
+;; Note: in releases prior to 0.4.0 this namespace also defined
+;; `read-spec-from-buffer`, `read-spec-from-file`,
+;; `write-spec-to-buffer!`, and `write-spec-to-file!`. They live in
+;; `clj-zip-meta.spec-io` now so that `core` can be loaded without
+;; Octet (Babashka, GraalVM native-image, etc.).
 
 ;; ============================================================================
 ;; Reading the full metadata
@@ -708,7 +671,7 @@
           extra-bytes    (- eocdr-off cdr-recorded)
           cdr-off-actual (+ (long (:cdr-offset-from-start-disk eocdr-rec))
                             extra-bytes)]
-      (when-not (valid-signature? r cdr-off-actual 4 (sig-bytes rec-cdr-header-sig))
+      (when-not (valid-signature? r cdr-off-actual 4 cdr-sig-bytes)
         (throw (ex-info "Central directory signature not found at expected offset"
                         {:file             (str f)
                          :eocdr-offset     eocdr-off
@@ -764,7 +727,7 @@
            extra-bytes    (- eocdr-off cdr-recorded)
            cdr-off-actual (+ (long (:cdr-offset-from-start-disk eocdr-rec))
                              extra-bytes)
-           sig            (sig-bytes rec-cdr-header-sig)
+           sig            cdr-sig-bytes
            siglen         (alength ^bytes sig)
            sig-ba         (byte-array siglen)
            _              (do (.position file-bb (int cdr-off-actual))
@@ -852,18 +815,18 @@
                  (conj (str extra " extra bytes at beginning or within zipfile"))
 
                  (not (valid-signature? f (:offset eo-cdr) 4
-                                        (sig-bytes rec-end-of-cdr-sig)))
+                                        eocdr-sig-bytes))
                  (conj "invalid end of cdr signature")
 
                  (some (fn [{offset :offset}]
                          (not (valid-signature? f offset 4
-                                                (sig-bytes rec-cdr-header-sig))))
+                                                cdr-sig-bytes)))
                        cdrs)
                  (conj "invalid cdr record signatures found")
 
                  (some (fn [{offset :offset}]
                          (not (valid-signature? f offset 4
-                                                (sig-bytes rec-local-file-header-sig))))
+                                                lfh-sig-bytes)))
                        locals)
                  (conj "invalid local record signatures found")
 
@@ -974,7 +937,7 @@
    (with-raf [r f "r"]
      (let [len            (.length r)
            ^ByteBuffer bb (map-region r "r" 0 len)
-           lfh-sig        (sig-bytes rec-local-file-header-sig)]
+           lfh-sig        lfh-sig-bytes]
        (loop [pos   (long extra-bytes)
               acc   (transient [])
               guard (long max-entries)]
