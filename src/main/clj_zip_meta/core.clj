@@ -29,7 +29,7 @@
            (java.util Arrays)
            (java.util.zip CRC32 Inflater)))
 
-(declare scan-backwards scan-forwards)
+(declare scan-backwards scan-forwards summarize)
 
 ;; ============================================================================
 ;; Internal helpers
@@ -1688,6 +1688,256 @@
 
       :else
       (assoc base :status :unsupported-method :method meth))))
+
+(defn extract-bytes
+  "Extract the uncompressed data of a single entry named `entry-name`
+  from `f`. Returns a byte array, or `nil` if the entry doesn't
+  exist.
+
+  Supports STORED (0) and DEFLATE (8) — every jar and the vast
+  majority of zips. Other compression methods throw `ex-info`.
+
+  This is the only `extract-…` function the library exposes — the
+  goal is *metadata inspection* rather than full archive extraction.
+  For pulling apart whole archives, use `java.util.zip.ZipFile`."
+  [f entry-name]
+  (let [m       (zip-meta f {:decode false})
+        extra   (long (:extra-bytes m))
+        cdr-rec (some #(when (= entry-name (:file-name (:record %)))
+                         %)
+                      (:cdr-records m))]
+    (when cdr-rec
+      (let [cdr      (:record cdr-rec)
+            meth     (long (:compression-method cdr))
+            usize    (long (:uncompressed-size cdr))
+            csize    (long (:compressed-size   cdr))
+            lfh-off  (+ (long (:relative-offset-local-header cdr)) extra)]
+        (with-raf [r f "r"]
+          (let [^ByteBuffer bb (map-region r "r" 0 (.length r))
+                nlen     (bit-and 0xFFFF (long (.getShort bb (int (+ lfh-off 26)))))
+                elen     (bit-and 0xFFFF (long (.getShort bb (int (+ lfh-off 28)))))
+                data-off (+ lfh-off 30 nlen elen)]
+            (cond
+              (zero? usize)
+              (byte-array 0)
+
+              (= 0 meth)
+              (let [out (byte-array csize)]
+                (.position bb (int data-off))
+                (.get bb out)
+                out)
+
+              (= 8 meth)
+              (let [compressed (byte-array csize)
+                    inflater   (Inflater. true)]
+                (try
+                  (.position bb (int data-off))
+                  (.get bb compressed)
+                  (.setInput inflater compressed)
+                  (let [out (byte-array usize)
+                        n   (.inflate inflater out 0 (int usize))]
+                    (if (= n usize)
+                      out
+                      (Arrays/copyOf out (int n))))
+                  (finally (.end inflater))))
+
+              :else
+              (throw (ex-info "extract-bytes: unsupported compression method"
+                              {:entry-name entry-name :method meth})))))))))
+
+(defn extract-string
+  "Extract the entry named `entry-name` from `f` and decode the bytes
+  as a UTF-8 string. Returns `nil` if the entry doesn't exist.
+  Charset can be overridden via the optional 3-arg form."
+  ([f entry-name] (extract-string f entry-name "UTF-8"))
+  ([f entry-name charset]
+   (when-let [ba (extract-bytes f entry-name)]
+     (String. ^bytes ba ^String charset))))
+
+(defn manifest
+  "Parse `META-INF/MANIFEST.MF` from `f` into a map of header name
+  (string) -> value (string). Continuation lines (lines starting
+  with a space, per the Java manifest spec) are joined onto the
+  preceding header. Returns `nil` if no manifest is present.
+
+  Per-entry attribute sections (separated by blank lines) are not
+  returned by this function; for those, use `manifest-sections`."
+  [f]
+  (when-let [text (extract-string f "META-INF/MANIFEST.MF")]
+    ;; Manifests can use CRLF, LF, or CR. Normalise to LF first.
+    (let [text (-> text (str/replace "\r\n" "\n") (str/replace "\r" "\n"))
+          ;; Take only the main section (before the first blank line).
+          main (first (str/split text #"\n\n" 2))
+          lines (str/split-lines main)
+          ;; Join continuation lines (starting with a space) onto the
+          ;; previous line, dropping the leading space.
+          joined (reduce
+                   (fn [acc line]
+                     (if (and (seq acc) (str/starts-with? line " "))
+                       (conj (pop acc) (str (peek acc) (subs line 1)))
+                       (conj acc line)))
+                   []
+                   lines)]
+      (into {}
+            (keep (fn [^String line]
+                    (when-let [i (let [n (.indexOf line ": ")]
+                                   (when (pos? n) n))]
+                      [(subs line 0 i) (subs line (+ i 2))])))
+            joined))))
+
+(defn manifest-sections
+  "Parse `META-INF/MANIFEST.MF` from `f` into the main attributes
+  map AND the per-entry sections. Returns:
+
+    {:main    {header -> value ...}
+     :entries [{header -> value ...} ...]}
+
+  Useful for jars that use the per-entry attribute syntax (signed
+  jars, etc.)."
+  [f]
+  (when-let [text (extract-string f "META-INF/MANIFEST.MF")]
+    (let [text (-> text (str/replace "\r\n" "\n") (str/replace "\r" "\n"))
+          sections (str/split text #"\n\n+")
+          parse-section
+          (fn [s]
+            (let [lines (str/split-lines s)
+                  joined (reduce
+                           (fn [acc line]
+                             (if (and (seq acc) (str/starts-with? line " "))
+                               (conj (pop acc) (str (peek acc) (subs line 1)))
+                               (conj acc line)))
+                           []
+                           lines)]
+              (into {}
+                    (keep (fn [^String line]
+                            (let [i (.indexOf line ": ")]
+                              (when (pos? i)
+                                [(subs line 0 i) (subs line (+ i 2))]))))
+                    joined)))]
+      {:main    (parse-section (first sections))
+       :entries (mapv parse-section (rest sections))})))
+
+(defn jar-info
+  "Distil `META-INF/MANIFEST.MF` from `f` into a small map of the
+  fields jars commonly carry:
+
+    `:main-class`        what `java -jar` will run
+    `:manifest-version`
+    `:created-by`
+    `:implementation-title`
+    `:implementation-version`
+    `:specification-title`
+    `:specification-version`
+    `:bundle-name`, `:bundle-version`,
+    `:bundle-symbolic-name`     (OSGi)
+    `:premain-class`            (Java agents)
+
+  Returns `nil` when there is no manifest. Unknown manifest entries
+  are not returned; use `manifest` for the full map."
+  [f]
+  (when-let [m (manifest f)]
+    (let [g #(get m %)]
+      (cond-> {}
+        (g "Main-Class")             (assoc :main-class             (g "Main-Class"))
+        (g "Manifest-Version")       (assoc :manifest-version       (g "Manifest-Version"))
+        (g "Created-By")             (assoc :created-by             (g "Created-By"))
+        (g "Implementation-Title")   (assoc :implementation-title   (g "Implementation-Title"))
+        (g "Implementation-Version") (assoc :implementation-version (g "Implementation-Version"))
+        (g "Specification-Title")    (assoc :specification-title    (g "Specification-Title"))
+        (g "Specification-Version")  (assoc :specification-version  (g "Specification-Version"))
+        (g "Bundle-Name")            (assoc :bundle-name            (g "Bundle-Name"))
+        (g "Bundle-Version")         (assoc :bundle-version         (g "Bundle-Version"))
+        (g "Bundle-SymbolicName")    (assoc :bundle-symbolic-name   (g "Bundle-SymbolicName"))
+        (g "Premain-Class")          (assoc :premain-class          (g "Premain-Class"))))))
+
+(defn class-index
+  "For a jar, group every `.class` entry by Java package. Returns a
+  sorted map of `package-string -> sorted vector of class names`.
+  The top-level (default) package is keyed under `\"\"`.
+
+  Inner classes (names containing `$`) are included; if you want to
+  exclude them, filter the resulting vectors."
+  [f]
+  (let [class-entries (->> (zip-entries f)
+                           (filter #(and (not (:directory? %))
+                                         (str/ends-with? (:file-name %) ".class"))))
+        by-pkg        (group-by
+                        (fn [e]
+                          (let [^String n (:file-name e)
+                                i (.lastIndexOf n (int \/))]
+                            (if (neg? i) ""
+                                (-> (subs n 0 i)
+                                    (str/replace "/" ".")))))
+                        class-entries)]
+    (into (sorted-map)
+          (for [[pkg es] by-pkg]
+            [pkg (->> es
+                      (map (fn [e]
+                             (let [^String n (:file-name e)
+                                   i         (.lastIndexOf n (int \/))
+                                   base      (if (neg? i) n (subs n (inc i)))]
+                               (subs base 0 (- (count base) 6))))) ; strip ".class"
+                      sort
+                      vec)]))))
+
+(defn pom-info
+  "For a Maven-built jar, find and parse
+  `META-INF/maven/{group}/{artifact}/pom.properties` if present.
+  Returns `{:group-id :artifact-id :version}` or `nil`.
+
+  Most Java jars include this; Clojure tools.deps-built jars and
+  hand-rolled uberjars may not."
+  [f]
+  (let [candidate (some
+                    (fn [{:keys [file-name]}]
+                      (when (and file-name
+                                 (re-matches
+                                   #"META-INF/maven/[^/]+/[^/]+/pom\.properties"
+                                   file-name))
+                        file-name))
+                    (zip-entries f))]
+    (when candidate
+      (when-let [text (extract-string f candidate)]
+        (let [props (->> (str/split-lines text)
+                         (remove #(or (str/blank? %) (str/starts-with? % "#")))
+                         (map #(str/split % #"=" 2))
+                         (filter #(= 2 (count %)))
+                         (into {}))]
+          (cond-> {}
+            (get props "groupId")    (assoc :group-id    (get props "groupId"))
+            (get props "artifactId") (assoc :artifact-id (get props "artifactId"))
+            (get props "version")    (assoc :version     (get props "version"))))))))
+
+(defn describe
+  "High-level \"what is this archive?\" summary. Combines
+  `summarize`, `jar-info`, `pom-info`, and a class / resource count
+  into a single map:
+
+    {:summary        summarize result
+     :jar-info       jar-info result (or nil)
+     :pom-info       pom-info result (or nil)
+     :class-count    how many `.class` entries
+     :resource-count how many non-`.class`, non-directory entries
+     :top-level-dirs sorted vec of immediate subdirectories}"
+  [f]
+  (let [entries   (zip-entries f)
+        classes   (filter #(and (not (:directory? %))
+                                (str/ends-with? (:file-name %) ".class"))
+                          entries)
+        resources (filter #(and (not (:directory? %))
+                                (not (str/ends-with? (:file-name %) ".class")))
+                          entries)
+        top-dirs  (->> entries
+                       (keep #(let [^String n (:file-name %)
+                                    i         (.indexOf n (int \/))]
+                                (when (>= i 0) (subs n 0 (inc i)))))
+                       set sort vec)]
+    {:summary        (summarize f)
+     :jar-info       (jar-info f)
+     :pom-info       (pom-info f)
+     :class-count    (count classes)
+     :resource-count (count resources)
+     :top-level-dirs top-dirs}))
 
 (defn verify-crcs
   "Read every entry's compressed data from `f`, decompress it, and

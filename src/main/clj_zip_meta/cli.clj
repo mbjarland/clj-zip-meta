@@ -24,6 +24,11 @@
     "Commands:"
     "  list      FILE [--match PAT]      List entries; optional regex/substring filter"
     "  tree      FILE [--match PAT]      Show entries as a directory tree"
+    "  manifest  FILE                    Parse META-INF/MANIFEST.MF (jars)"
+    "  jar-info  FILE                    High-level jar info (Main-Class, version, …)"
+    "  describe  FILE                    What is this jar? (manifest + pom + counts)"
+    "  classes   FILE                    .class entries grouped by Java package"
+    "  cat       FILE ENTRY              Extract one entry to stdout"
     "  meta      FILE                    Pretty-print the full metadata map"
     "  summary   FILE                    Print a high-level summary"
     "  inspect   FILE ENTRY-NAME         Pretty-print everything about one entry"
@@ -255,6 +260,59 @@
       (do (println (->json (zm/layout f))) (flush))
       (zm/print-layout f {:width width}))))
 
+(defn- manifest-cmd [f json?]
+  (if-let [m (zm/manifest f)]
+    (emit json?
+          (fn []
+            (doseq [[k v] (sort-by key m)]
+              (println (format "%-30s %s" (str k ":") v))))
+          m)
+    (do (println "no MANIFEST.MF in this archive") (System/exit 1))))
+
+(defn- jar-info-cmd [f json?]
+  (if-let [info (zm/jar-info f)]
+    (emit json? #(pp/pprint info) info)
+    (do (println "no MANIFEST.MF in this archive") (System/exit 1))))
+
+(defn- describe-cmd [f json?]
+  (let [d (zm/describe f)]
+    (emit json?
+          (fn []
+            (let [{:keys [summary jar-info pom-info
+                          class-count resource-count top-level-dirs]} d]
+              (println (str "entries:        " (:entry-count summary)
+                            " (" class-count " classes, " resource-count " resources)"))
+              (println (str "uncompressed:   " (:total-uncompressed summary) " bytes"))
+              (println (str "compressed:     " (:total-compressed   summary) " bytes"))
+              (when (seq (:zip-comment summary))
+                (println (str "archive-comment: " (:zip-comment summary))))
+              (when jar-info
+                (println "manifest:")
+                (doseq [[k v] (sort-by key jar-info)]
+                  (println (format "  %-22s %s" (str (name k) ":") v))))
+              (when pom-info
+                (println "maven:")
+                (doseq [[k v] (sort-by key pom-info)]
+                  (println (format "  %-22s %s" (str (name k) ":") v))))
+              (when (seq top-level-dirs)
+                (println (str "top-level dirs: " (str/join " " top-level-dirs))))))
+          d)))
+
+(defn- classes-cmd [f json?]
+  (let [idx (zm/class-index f)]
+    (emit json?
+          (fn []
+            (doseq [[pkg cs] idx]
+              (println (str (if (empty? pkg) "<root>" pkg)
+                            " (" (count cs) ")"))
+              (doseq [c cs] (println (str "  " c)))))
+          idx)))
+
+(defn- cat-cmd [f entry-name]
+  (if-let [ba (zm/extract-bytes f entry-name)]
+    (.write (System/out) ^bytes ba)
+    (do (println (str "no entry named " (pr-str entry-name))) (System/exit 1))))
+
 (defn- analyze-cmd [f json?]
   (let [r (za/analyze f)]
     (emit json?
@@ -364,6 +422,11 @@
       "layout"   (layout-cmd file rest json?)
       "hexdump"  (hexdump-cmd file (first rest) (second rest) json?)
       "analyze"  (analyze-cmd file json?)
+      "manifest" (manifest-cmd file json?)
+      "jar-info" (jar-info-cmd file json?)
+      "describe" (describe-cmd file json?)
+      "classes"  (classes-cmd file json?)
+      "cat"      (cat-cmd file (first rest))
       (do (println usage)
           (flush)
           (System/exit (if cmd 1 0))))))
