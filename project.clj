@@ -1,4 +1,4 @@
-(defproject clj-zip-meta/clj-zip-meta "0.2.0"
+(defproject clj-zip-meta/clj-zip-meta "0.3.0"
   :description "A Clojure library for reading and patching the binary
                 metadata of zip and jar files (local file headers, central
                 directory headers, end-of-central-directory record)."
@@ -21,9 +21,13 @@
              :provided {:dependencies [[org.clojure/clojure "1.12.0"]]}
              :1.10     {:dependencies [[org.clojure/clojure "1.10.3"]]}
              :1.11     {:dependencies [[org.clojure/clojure "1.11.4"]]}
-             :1.12     {:dependencies [[org.clojure/clojure "1.12.0"]]}}
+             :1.12     {:dependencies [[org.clojure/clojure "1.12.0"]]}
+             :bench    {:source-paths ["bench"]
+                        :dependencies [[criterium/criterium "0.4.6"]]
+                        :main         clj-zip-meta.bench}}
 
-  :aliases {"test-all" ["with-profile" "+1.10:+1.11:+1.12" "test"]}
+  :aliases {"test-all" ["with-profile" "+1.10:+1.11:+1.12" "test"]
+            "bench"    ["with-profile" "+bench" "run"]}
 
   ;; Deploy credentials are read from the CLOJARS_USERNAME and
   ;; CLOJARS_PASSWORD environment variables — the CI release workflow

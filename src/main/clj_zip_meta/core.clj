@@ -32,7 +32,10 @@
   (:import (java.io File RandomAccessFile)
            (java.nio ByteBuffer ByteOrder MappedByteBuffer)
            (java.nio.channels FileChannel FileChannel$MapMode)
-           (java.util Arrays)))
+           (java.nio.charset StandardCharsets)
+           (java.time LocalDateTime)
+           (java.util Arrays)
+           (java.util.zip CRC32 Inflater)))
 
 (declare scan-backwards scan-forwards)
 
@@ -141,6 +144,355 @@
   [^ByteBuffer bb data spec ^long off]
   (buf/with-byte-order :little-endian
     (buf/write! bb data spec {:offset off})))
+
+;; ----------------------------------------------------------------------------
+;; Hand-rolled fast readers.
+;;
+;; octet is a great library but it pays a heavy per-field cost via
+;; protocol dispatch and dynamic-var lookup; on a 3 770-entry jar a
+;; full zip-meta call was taking ~1.9 s. The readers below operate
+;; directly on a little-endian ByteBuffer and produce records with the
+;; same key/value shape octet would produce, so callers see no
+;; difference. They cut the hot path to a few tens of milliseconds.
+
+(defn- str-utf8 ^String [^ByteBuffer bb ^long pos ^long len]
+  (if (zero? len)
+    ""
+    (let [ba (byte-array (int len))]
+      (.position bb (int pos))
+      (.get bb ba)
+      (String. ba 0 (int len) StandardCharsets/UTF_8))))
+
+(defn- bytes-at ^bytes [^ByteBuffer bb ^long pos ^long len]
+  (let [ba (byte-array (int len))]
+    (when (pos? len)
+      (.position bb (int pos))
+      (.get bb ba))
+    ba))
+
+(defn- read-eocdr! [^ByteBuffer bb ^long pos]
+  (let [sig   (.getInt   bb (int pos))
+        nd    (.getShort bb (int (+ pos 4)))
+        nc    (.getShort bb (int (+ pos 6)))
+        ehere (.getShort bb (int (+ pos 8)))
+        etot  (.getShort bb (int (+ pos 10)))
+        csz   (.getInt   bb (int (+ pos 12)))
+        cof   (.getInt   bb (int (+ pos 16)))
+        clen  (.getShort bb (int (+ pos 20)))
+        cmt   (str-utf8 bb (+ pos 22) (bit-and 0xFFFF clen))]
+    {:end-of-cdr-signature       sig
+     :number-of-this-disk        nd
+     :number-of-cdr-disk         nc
+     :cdr-entries-this-disk      ehere
+     :cdr-entries-total          etot
+     :cdr-size                   csz
+     :cdr-offset-from-start-disk cof
+     :zip-comment-length         clen
+     :zip-comment                cmt}))
+
+(defn- read-cdr! [^ByteBuffer bb ^long pos]
+  (let [sig    (.getInt   bb (int pos))
+        vmade  (.getShort bb (int (+ pos 4)))
+        vneed  (.getShort bb (int (+ pos 6)))
+        gp     (.getShort bb (int (+ pos 8)))
+        meth   (.getShort bb (int (+ pos 10)))
+        time   (.getShort bb (int (+ pos 12)))
+        date   (.getShort bb (int (+ pos 14)))
+        crc    (.getInt   bb (int (+ pos 16)))
+        csize  (.getInt   bb (int (+ pos 20)))
+        usize  (.getInt   bb (int (+ pos 24)))
+        nlen   (.getShort bb (int (+ pos 28)))
+        elen   (.getShort bb (int (+ pos 30)))
+        cmtlen (.getShort bb (int (+ pos 32)))
+        dn     (.getShort bb (int (+ pos 34)))
+        iattr  (.getShort bb (int (+ pos 36)))
+        eattr  (.getInt   bb (int (+ pos 38)))
+        roff   (.getInt   bb (int (+ pos 42)))
+        nlu    (bit-and 0xFFFF nlen)
+        elu    (bit-and 0xFFFF elen)
+        clu    (bit-and 0xFFFF cmtlen)
+        nm     (str-utf8 bb (+ pos 46)          nlu)
+        ex     (bytes-at bb (+ pos 46 nlu)      elu)
+        cmt    (str-utf8 bb (+ pos 46 nlu elu)  clu)]
+    {:cdr-header-signature         sig
+     :version-made-by              vmade
+     :version-needed-to-extract    vneed
+     :general-purpose              gp
+     :compression-method           meth
+     :last-mod-file-time           time
+     :last-mod-file-date           date
+     :crc-32                       crc
+     :compressed-size              csize
+     :uncompressed-size            usize
+     :file-name-length             nlen
+     :extra-field-length           elen
+     :file-comment-length          cmtlen
+     :disk-number-start            dn
+     :internal-file-attributes     iattr
+     :external-file-attributes     eattr
+     :relative-offset-local-header roff
+     :file-name                    nm
+     :extra-field                  ex
+     :file-comment                 cmt}))
+
+(defn- cdr-size* ^long [cdr]
+  (+ 46
+     (bit-and 0xFFFF (long (:file-name-length    cdr)))
+     (bit-and 0xFFFF (long (:extra-field-length  cdr)))
+     (bit-and 0xFFFF (long (:file-comment-length cdr)))))
+
+(defn- read-lfh! [^ByteBuffer bb ^long pos]
+  (let [sig   (.getInt   bb (int pos))
+        vneed (.getShort bb (int (+ pos 4)))
+        gp    (.getShort bb (int (+ pos 6)))
+        meth  (.getShort bb (int (+ pos 8)))
+        time  (.getShort bb (int (+ pos 10)))
+        date  (.getShort bb (int (+ pos 12)))
+        crc   (.getInt   bb (int (+ pos 14)))
+        csize (.getInt   bb (int (+ pos 18)))
+        usize (.getInt   bb (int (+ pos 22)))
+        nlen  (.getShort bb (int (+ pos 26)))
+        elen  (.getShort bb (int (+ pos 28)))
+        nlu   (bit-and 0xFFFF nlen)
+        elu   (bit-and 0xFFFF elen)
+        nm    (str-utf8 bb (+ pos 30)     nlu)
+        ex    (bytes-at bb (+ pos 30 nlu) elu)]
+    {:local-header-signature    sig
+     :version-needed-to-extract vneed
+     :general-purpose           gp
+     :compression-method        meth
+     :last-mod-file-time        time
+     :last-mod-file-date        date
+     :crc-32                    crc
+     :compressed-size           csize
+     :uncompressed-size         usize
+     :file-name-length          nlen
+     :extra-field-length        elen
+     :file-name                 nm
+     :extra-field               ex}))
+
+(defn- lfh-size* ^long [lfh]
+  (+ 30
+     (bit-and 0xFFFF (long (:file-name-length lfh)))
+     (bit-and 0xFFFF (long (:extra-field-length lfh)))))
+
+;; ----------------------------------------------------------------------------
+;; Hand-rolled writers (mirroring the readers above).
+;;
+;; Octet handles writes correctly but at the same per-field protocol-
+;; dispatch cost as reads. These writers operate directly on a
+;; little-endian ByteBuffer. Each returns the total number of bytes
+;; written. The public octet-based write-spec-to-* functions are kept
+;; for backwards compatibility.
+
+(defn- write-eocdr! ^long [^ByteBuffer bb ^long pos eocdr]
+  (let [cmt  (str (or (:zip-comment eocdr) ""))
+        cbs  (.getBytes cmt "UTF-8")
+        clen (alength cbs)]
+    (.putInt   bb (int pos)        (unchecked-int   (long (:end-of-cdr-signature       eocdr))))
+    (.putShort bb (int (+ pos 4))  (unchecked-short (long (:number-of-this-disk        eocdr))))
+    (.putShort bb (int (+ pos 6))  (unchecked-short (long (:number-of-cdr-disk         eocdr))))
+    (.putShort bb (int (+ pos 8))  (unchecked-short (long (:cdr-entries-this-disk      eocdr))))
+    (.putShort bb (int (+ pos 10)) (unchecked-short (long (:cdr-entries-total          eocdr))))
+    (.putInt   bb (int (+ pos 12)) (unchecked-int   (long (:cdr-size                   eocdr))))
+    (.putInt   bb (int (+ pos 16)) (unchecked-int   (long (:cdr-offset-from-start-disk eocdr))))
+    (.putShort bb (int (+ pos 20)) (unchecked-short (long clen)))
+    (when (pos? clen)
+      (.position bb (int (+ pos 22)))
+      (.put bb cbs))
+    (+ 22 clen)))
+
+(defn- write-cdr! ^long [^ByteBuffer bb ^long pos cdr]
+  (let [nm   (str (or (:file-name    cdr) ""))
+        cmt  (str (or (:file-comment cdr) ""))
+        ex   (or  (:extra-field cdr) (byte-array 0))
+        nbs  (.getBytes nm "UTF-8")
+        cbs  (.getBytes cmt "UTF-8")
+        nlen (alength nbs)
+        elen (alength ^bytes ex)
+        clen (alength cbs)]
+    (.putInt   bb (int pos)        (unchecked-int   (long (:cdr-header-signature         cdr))))
+    (.putShort bb (int (+ pos 4))  (unchecked-short (long (:version-made-by              cdr))))
+    (.putShort bb (int (+ pos 6))  (unchecked-short (long (:version-needed-to-extract    cdr))))
+    (.putShort bb (int (+ pos 8))  (unchecked-short (long (:general-purpose              cdr))))
+    (.putShort bb (int (+ pos 10)) (unchecked-short (long (:compression-method           cdr))))
+    (.putShort bb (int (+ pos 12)) (unchecked-short (long (:last-mod-file-time           cdr))))
+    (.putShort bb (int (+ pos 14)) (unchecked-short (long (:last-mod-file-date           cdr))))
+    (.putInt   bb (int (+ pos 16)) (unchecked-int   (long (:crc-32                       cdr))))
+    (.putInt   bb (int (+ pos 20)) (unchecked-int   (long (:compressed-size              cdr))))
+    (.putInt   bb (int (+ pos 24)) (unchecked-int   (long (:uncompressed-size            cdr))))
+    (.putShort bb (int (+ pos 28)) (unchecked-short (long nlen)))
+    (.putShort bb (int (+ pos 30)) (unchecked-short (long elen)))
+    (.putShort bb (int (+ pos 32)) (unchecked-short (long clen)))
+    (.putShort bb (int (+ pos 34)) (unchecked-short (long (:disk-number-start            cdr))))
+    (.putShort bb (int (+ pos 36)) (unchecked-short (long (:internal-file-attributes     cdr))))
+    (.putInt   bb (int (+ pos 38)) (unchecked-int   (long (:external-file-attributes     cdr))))
+    (.putInt   bb (int (+ pos 42)) (unchecked-int   (long (:relative-offset-local-header cdr))))
+    (.position bb (int (+ pos 46)))
+    (when (pos? nlen) (.put bb nbs))
+    (when (pos? elen) (.put bb ^bytes ex))
+    (when (pos? clen) (.put bb cbs))
+    (+ 46 nlen elen clen)))
+
+;; ----------------------------------------------------------------------------
+;; Decoded convenience fields
+;;
+;; The raw record fields preserve the on-disk bit pattern verbatim
+;; (so writes can round-trip cleanly). These helpers layer
+;; higher-level interpretations on top:
+;;
+;;   :last-modified      java.time.LocalDateTime decoded from
+;;                       :last-mod-file-time + :last-mod-file-date
+;;   :dos-attributes     set of keywords decoded from the low byte of
+;;                       :external-file-attributes (CDR) — :read-only
+;;                       :hidden :system :volume :directory :archive
+;;   :unix-mode          Unix file mode from the high 16 bits of
+;;                       :external-file-attributes when version-made-by
+;;                       reports Unix (host code 3); nil otherwise.
+;;   :directory?         convenience boolean (file name ends with "/" or
+;;                       DOS directory bit is set)
+;;   :encrypted?         general-purpose bit 0
+;;   :utf8-name?         general-purpose bit 11
+;;   :extra-fields       parsed list of TLVs from :extra-field
+;;                       (each {:tag T :data bytes [+ decoded keys]}).
+
+(defn- ^LocalDateTime dos->ldt [^long dos-date ^long dos-time]
+  (let [year   (+ 1980 (bit-and 0x7F (unsigned-bit-shift-right dos-date 9)))
+        month  (bit-and 0x0F (unsigned-bit-shift-right dos-date 5))
+        day    (bit-and 0x1F dos-date)
+        hour   (bit-and 0x1F (unsigned-bit-shift-right dos-time 11))
+        minute (bit-and 0x3F (unsigned-bit-shift-right dos-time 5))
+        second (* 2 (bit-and 0x1F dos-time))]
+    (when (and (<= 1 month 12) (<= 1 day 31)
+               (<= 0 hour 23) (<= 0 minute 59) (<= 0 second 59))
+      (try (LocalDateTime/of (int year) (int month) (int day)
+                             (int hour) (int minute) (int second))
+           (catch Exception _ nil)))))
+
+(def ^:private dos-attr-bits
+  [[0x01 :read-only]
+   [0x02 :hidden]
+   [0x04 :system]
+   [0x08 :volume]
+   [0x10 :directory]
+   [0x20 :archive]])
+
+(defn- dos-attrs [^long external-file-attributes]
+  (let [low (bit-and 0xFF external-file-attributes)]
+    (persistent!
+      (reduce
+        (fn [acc [bit kw]]
+          (if (pos? (bit-and bit low)) (conj! acc kw) acc))
+        (transient #{})
+        dos-attr-bits))))
+
+(defn- unix-mode-from
+  "Decode the Unix mode from `:external-file-attributes` when
+  version-made-by's host byte is Unix (3). The mode lives in the
+  high 16 bits (bits 16..31 after a shift)."
+  [^long version-made-by ^long external-file-attributes]
+  (when (= 3 (bit-and 0xFF (unsigned-bit-shift-right version-made-by 8)))
+    (bit-and 0xFFFF (unsigned-bit-shift-right external-file-attributes 16))))
+
+(def ^:private extra-tags
+  {0x0001 :zip64
+   0x000A :ntfs
+   0x000D :pkware-unix
+   0x5455 :extended-timestamp
+   0x5855 :infozip-unix-old
+   0x7855 :infozip-unix-new
+   0x6375 :infozip-utf8-comment
+   0x7075 :infozip-utf8-path
+   0x9901 :aes})
+
+(defn- read-bytes-from
+  [^bytes ba ^long off ^long len]
+  (let [out (byte-array (int len))]
+    (System/arraycopy ba (int off) out 0 (int len))
+    out))
+
+(defn- decode-extended-timestamp
+  "Bit 0: mtime, bit 1: atime, bit 2: ctime; each present time is a
+  signed 32-bit Unix timestamp following the flag byte."
+  [^bytes data]
+  (try
+    (when (pos? (alength data))
+      (let [bb    (-> (ByteBuffer/wrap data) (.order ByteOrder/LITTLE_ENDIAN))
+            flags (bit-and 0xFF (long (.get bb 0)))
+            out   (transient {:flags flags})]
+        (loop [pos 1
+               kws [[0x01 :mtime] [0x02 :atime] [0x04 :ctime]]]
+          (if (or (empty? kws) (> (+ pos 4) (alength data)))
+            (persistent! out)
+            (let [[bit kw] (first kws)]
+              (if (pos? (bit-and bit flags))
+                (do (assoc! out kw (.getInt bb (int pos)))
+                    (recur (+ pos 4) (rest kws)))
+                (recur pos (rest kws))))))))
+    (catch Exception _ nil)))
+
+(defn- decode-extra-field [tag ^bytes data]
+  (case tag
+    :extended-timestamp (decode-extended-timestamp data)
+    nil))
+
+(defn- parse-extra-fields
+  "Parse the byte array `ba` as a sequence of zip extra-field TLV
+  records. Returns a vector of `{:tag T :tag-name K :size N :data bytes}`
+  maps, where `:tag-name` is a known keyword (or nil) and `:decoded`
+  appears when the tag has a decoder."
+  [^bytes ba]
+  (let [len (alength ba)]
+    (loop [pos 0
+           acc (transient [])]
+      (if (> (+ pos 4) len)
+        (persistent! acc)
+        (let [bb     (-> (ByteBuffer/wrap ba) (.order ByteOrder/LITTLE_ENDIAN))
+              tag-i  (bit-and 0xFFFF (long (.getShort bb (int pos))))
+              size   (bit-and 0xFFFF (long (.getShort bb (int (+ pos 2)))))
+              end    (+ pos 4 size)]
+          (if (> end len)
+            (persistent! acc)
+            (let [data    (read-bytes-from ba (+ pos 4) size)
+                  tag-kw  (get extra-tags tag-i)
+                  base    {:tag tag-i :tag-name tag-kw :size size :data data}
+                  decoded (when tag-kw (decode-extra-field tag-kw data))]
+              (recur end
+                     (conj! acc (cond-> base
+                                  decoded (assoc :decoded decoded)))))))))))
+
+(defn- decorate-cdr
+  "Add decoded convenience keys to a raw CDR record."
+  [cdr]
+  (let [gp     (long (:general-purpose cdr))
+        eattr  (long (:external-file-attributes cdr))
+        vmade  (long (:version-made-by cdr))
+        name   (:file-name cdr)
+        dattrs (dos-attrs eattr)]
+    (assoc cdr
+      :last-modified    (dos->ldt (long (:last-mod-file-date cdr))
+                                  (long (:last-mod-file-time cdr)))
+      :dos-attributes   dattrs
+      :unix-mode        (unix-mode-from vmade eattr)
+      :directory?       (or (contains? dattrs :directory)
+                            (and (string? name) (str/ends-with? name "/")))
+      :encrypted?       (pos? (bit-and gp 0x0001))
+      :utf8-name?       (pos? (bit-and gp 0x0800))
+      :extra-fields     (parse-extra-fields (:extra-field cdr)))))
+
+(defn- decorate-lfh
+  "Add decoded convenience keys to a raw LFH record (no
+  :external-file-attributes here)."
+  [lfh]
+  (let [gp   (long (:general-purpose lfh))
+        name (:file-name lfh)]
+    (assoc lfh
+      :last-modified  (dos->ldt (long (:last-mod-file-date lfh))
+                                (long (:last-mod-file-time lfh)))
+      :directory?     (and (string? name) (str/ends-with? name "/"))
+      :encrypted?     (pos? (bit-and gp 0x0001))
+      :utf8-name?     (pos? (bit-and gp 0x0800))
+      :extra-fields   (parse-extra-fields (:extra-field lfh)))))
 
 ;; ============================================================================
 ;; Public low-level API
@@ -278,14 +630,15 @@
 (defn- read-cdr-records*
   "Read `entries` consecutive CDR records from `bb` starting at byte
   position `start-off`. Returns a vector of `{:offset N :record M}`."
-  [^ByteBuffer bb ^long start-off ^long entries]
+  [^ByteBuffer bb ^long start-off ^long entries decode?]
   (loop [acc (transient [])
          off start-off
          n   entries]
     (if (zero? n)
       (persistent! acc)
-      (let [record (read-spec-bb bb rec-cdr-header off)
-            sz     (long (ospec/size* rec-cdr-header record))]
+      (let [raw    (read-cdr! bb off)
+            sz     (cdr-size* raw)
+            record (if decode? (decorate-cdr raw) raw)]
         (recur (conj! acc {:offset off :record record})
                (+ off sz)
                (dec n))))))
@@ -295,32 +648,38 @@
   buffer that covers the start of the file at least through the
   beginning of the central directory. `extra-bytes` is added to each
   recorded `:relative-offset-local-header`."
-  [^ByteBuffer bb cdr-records ^long extra-bytes]
+  [^ByteBuffer bb cdr-records ^long extra-bytes decode?]
   (mapv
     (fn [cdr]
-      (let [off    (+ (long (:relative-offset-local-header cdr)) extra-bytes)
-            record (read-spec-bb bb rec-local-file-header off)]
-        {:offset off :record record}))
+      (let [off (+ (long (:relative-offset-local-header cdr)) extra-bytes)
+            raw (read-lfh! bb off)]
+        {:offset off
+         :record (if decode? (decorate-lfh raw) raw)}))
     cdr-records))
 
 (defn get-cdr-records
   "Read `entries` central directory records from file `f` starting at
-  byte offset `off`. Returns a vector of `{:offset N :record M}`."
+  byte offset `off`. Returns a vector of `{:offset N :record M}`.
+  Records include the decoded convenience keys
+  (`:last-modified`, `:dos-attributes`, `:unix-mode`, `:directory?`,
+  `:encrypted?`, `:utf8-name?`, `:extra-fields`)."
   [f off entries]
   {:pre [(valid-offset? off)]}
   (with-raf [r f "r"]
     (let [bb (map-region r "r" 0 (.length r))]
-      (read-cdr-records* bb (long off) (long entries)))))
+      (read-cdr-records* bb (long off) (long entries) true))))
 
 (defn get-local-records
   "Read the local file headers referenced by `cdr-records` from file
   `f`. `cdr-offset` is the central-directory start offset (used as a
   buffer-mapping upper bound). `extra-bytes` is added to each
-  `:relative-offset-local-header` value."
+  `:relative-offset-local-header` value. Records include the decoded
+  convenience keys (`:last-modified`, `:directory?`, `:encrypted?`,
+  `:utf8-name?`, `:extra-fields`)."
   [f cdr-records cdr-offset extra-bytes]
   (with-raf [r f "r"]
     (let [bb (map-region r "r" 0 (long cdr-offset))]
-      (read-local-records* bb cdr-records (long extra-bytes)))))
+      (read-local-records* bb cdr-records (long extra-bytes) true))))
 
 (defn read-end-of-cdr-record
   "Find and read the end-of-central-directory record from `f`.
@@ -343,7 +702,7 @@
                              (throw (ex-info "End-of-central-directory record not found"
                                              {:file (str f) :length len})))
           bb             (map-region r "r" eocdr-off (- len eocdr-off))
-          eocdr-rec      (read-spec-bb bb rec-end-of-cdr 0)
+          eocdr-rec      (read-eocdr! bb 0)
           cdr-recorded   (+ (long (:cdr-offset-from-start-disk eocdr-rec))
                             (long (:cdr-size eocdr-rec)))
           extra-bytes    (- eocdr-off cdr-recorded)
@@ -377,14 +736,21 @@
   when only the central directory is needed.
 
   Each `:record` map mirrors the corresponding zip-specification
-  record (see `clj-zip-meta.spec` and APPNOTE.TXT §4.3). Throws
-  `ex-info` if the archive is malformed.
+  record (see `clj-zip-meta.spec` and APPNOTE.TXT §4.3) and is
+  augmented with decoded convenience keys: `:last-modified`
+  (LocalDateTime), `:directory?`, `:encrypted?`, `:utf8-name?`,
+  `:extra-fields` (parsed TLV vector), and on CDR entries
+  `:dos-attributes` (set) and `:unix-mode` (octal). Pass
+  `{:decode false}` to skip decoration and get the raw fields only.
+
+  Throws `ex-info` if the archive is malformed.
 
   Performance note: this function memory-maps the file once and reads
   every record from a single mapping; the channel is released as the
   function returns."
   ([f] (zip-meta f {}))
-  ([f {:keys [include-locals] :or {include-locals true}}]
+  ([f {:keys [include-locals decode]
+       :or   {include-locals true decode true}}]
    (with-raf [r f "r"]
      (let [len            (.length r)
            eocdr-off      (or (find-end-of-cdr-offset r)
@@ -392,7 +758,7 @@
                                               {:file (str f) :length len})))
            ^ByteBuffer
            file-bb        (map-region r "r" 0 len)
-           eocdr-rec      (read-spec-bb file-bb rec-end-of-cdr eocdr-off)
+           eocdr-rec      (read-eocdr! file-bb eocdr-off)
            cdr-recorded   (+ (long (:cdr-offset-from-start-disk eocdr-rec))
                              (long (:cdr-size eocdr-rec)))
            extra-bytes    (- eocdr-off cdr-recorded)
@@ -410,13 +776,14 @@
                                                  :expected-cdr-off cdr-off-actual
                                                  :extra-bytes      extra-bytes}))))
            entries        (long (:cdr-entries-total eocdr-rec))
-           cdrs           (read-cdr-records* file-bb cdr-off-actual entries)
+           cdrs           (read-cdr-records* file-bb cdr-off-actual entries (boolean decode))
            base           {:extra-bytes       extra-bytes
                            :end-of-cdr-record {:offset eocdr-off :record eocdr-rec}
                            :cdr-records       cdrs}]
        (if include-locals
          (assoc base :local-records
-                (read-local-records* file-bb (mapv :record cdrs) extra-bytes))
+                (read-local-records* file-bb (mapv :record cdrs)
+                                     extra-bytes (boolean decode)))
          base)))))
 
 ;; ============================================================================
@@ -440,13 +807,11 @@
         (let [len (.length r)
               bb  (map-region r "rw" 0 len)]
           (doseq [{offset :offset cdr :record} (:cdr-records meta)]
-            (write-spec-bb! bb
-                            (update cdr :relative-offset-local-header + extra-bytes)
-                            rec-cdr-header offset))
+            (write-cdr! bb offset
+                        (update cdr :relative-offset-local-header + extra-bytes)))
           (let [{eo-off :offset eo :record} (:end-of-cdr-record meta)]
-            (write-spec-bb! bb
-                            (update eo :cdr-offset-from-start-disk + extra-bytes)
-                            rec-end-of-cdr eo-off))
+            (write-eocdr! bb eo-off
+                          (update eo :cdr-offset-from-start-disk + extra-bytes)))
           (.force ^MappedByteBuffer bb))))
     f))
 
@@ -460,13 +825,17 @@
 
   Options:
 
-    `:repair` — when truthy, rewrites prepended-byte offset drift in
-                place before re-running the validation. Defaults to
-                false.
-    `:print`  — when truthy, prints each issue to `*out*`. Defaults
-                to false. Provided for compatibility with the prior
-                side-effecting behavior."
-  [f & {:keys [repair print]}]
+    `:repair`     — when truthy, rewrites prepended-byte offset
+                    drift in place before re-running the validation.
+                    Defaults to false.
+    `:verify-crcs` — when truthy, also runs `verify-crcs` and rolls
+                    any CRC mismatches / inflate errors into the
+                    `:issues` vector. Defaults to false because it
+                    has to read every entry's compressed data.
+    `:print`      — when truthy, prints each issue to `*out*`.
+                    Defaults to false. Provided for compatibility
+                    with the prior side-effecting behavior."
+  [f & {:keys [repair print verify-crcs]}]
   (when repair
     (repair-zip-with-preamble-bytes f))
   (let [meta   (zip-meta f)
@@ -474,6 +843,10 @@
         locals (:local-records meta)
         cdrs   (:cdr-records meta)
         extra  (long (:extra-bytes meta))
+        crc-fail (when verify-crcs
+                   (->> (verify-crcs f)
+                        (filter #(contains? #{:mismatch :error} (:status %)))
+                        seq))
         issues (cond-> []
                  (pos? extra)
                  (conj (str extra " extra bytes at beginning or within zipfile"))
@@ -492,7 +865,12 @@
                          (not (valid-signature? f offset 4
                                                 (sig-bytes rec-local-file-header-sig))))
                        locals)
-                 (conj "invalid local record signatures found"))]
+                 (conj "invalid local record signatures found")
+
+                 crc-fail
+                 (into (map (fn [r]
+                              (str "CRC " (name (:status r)) " for " (:file-name r)))
+                            crc-fail)))]
     (when print (run! println issues))
     {:valid?      (empty? issues)
      :issues      issues
@@ -615,9 +993,9 @@
                (persistent! acc)
 
                (= lfh-sig-int sig-int)
-               (let [lfh      (read-spec-bb bb rec-local-file-header pos)
+               (let [lfh      (read-lfh! bb pos)
                      gp       (long (:general-purpose lfh))
-                     hdr-size (long (ospec/size* rec-local-file-header lfh))]
+                     hdr-size (lfh-size* lfh)]
                  (if (pos? (bit-and gp 0x8))
                    (let [data-start (+ pos hdr-size)
                          dd         (locate-data-descriptor bb data-start len)]
@@ -735,9 +1113,9 @@
                             base)))
                       locals)
          cdr-start (long (:end-offset (last locals)))
-         cdr-size  (reduce + 0 (map #(long (ospec/size* rec-cdr-header %)) cdrs))
+         cdr-size  (reduce + 0 (map cdr-size* cdrs))
          eocdr     (mk-eocdr cdrs (- cdr-start extra) cdr-size zip-comment)
-         eocdr-size (long (ospec/size* rec-end-of-cdr eocdr))
+         eocdr-size (+ 22 (alength (.getBytes ^String zip-comment "UTF-8")))
          total     (+ cdr-start cdr-size eocdr-size)]
      (with-raf [r f "rw"]
        (.setLength r total)
@@ -745,10 +1123,10 @@
          (loop [pos cdr-start
                 rs  cdrs]
            (when-let [rec (first rs)]
-             (write-spec-bb! bb rec rec-cdr-header pos)
-             (recur (+ pos (long (ospec/size* rec-cdr-header rec)))
+             (write-cdr! bb pos rec)
+             (recur (+ pos (cdr-size* rec))
                     (rest rs))))
-         (write-spec-bb! bb eocdr rec-end-of-cdr (+ cdr-start cdr-size))
+         (write-eocdr! bb (+ cdr-start cdr-size) eocdr)
          (.force ^MappedByteBuffer bb)))
      f)))
 
@@ -864,6 +1242,11 @@
     `:crc-32`              — CRC-32 of the uncompressed data
     `:compression-method`  — 0 = stored, 8 = deflate, etc.
     `:offset`              — file offset of the CDR record
+    `:directory?`          — true if the entry is a directory
+    `:encrypted?`          — true if general-purpose bit 0 is set
+    `:last-modified`       — `java.time.LocalDateTime` of the entry
+    `:unix-mode`           — Unix file mode (octal) or nil
+    `:dos-attributes`      — set of DOS-attribute keywords
 
   Reads only the central directory — much faster than `zip-meta` for
   archives with many entries when local file headers are not needed."
@@ -876,7 +1259,12 @@
        :uncompressed-size  (:uncompressed-size cdr)
        :crc-32             (:crc-32 cdr)
        :compression-method (:compression-method cdr)
-       :offset             offset})
+       :offset             offset
+       :directory?         (:directory? cdr)
+       :encrypted?         (:encrypted? cdr)
+       :last-modified      (:last-modified cdr)
+       :unix-mode          (:unix-mode cdr)
+       :dos-attributes     (:dos-attributes cdr)})
     (:cdr-records (zip-meta f {:include-locals false}))))
 
 (defn find-entry
@@ -884,6 +1272,113 @@
   compact summary map (see `zip-entries`) or `nil` if not found."
   [f file-name]
   (some #(when (= (:file-name %) file-name) %) (zip-entries f)))
+
+;; ----------------------------------------------------------------------------
+;; CRC verification
+
+(defn- compute-crc-for-entry
+  "Verify one entry's data against its recorded CRC-32. Returns a
+  map with :file-name, :status (`:ok` / `:mismatch` / `:empty` /
+  `:unsupported-method` / `:error`), :recorded-crc, optional
+  :computed-crc, optional :error / :method."
+  [^ByteBuffer file-bb cdr ^long extra-bytes]
+  (let [name      (:file-name cdr)
+        recorded  (long (:crc-32 cdr))
+        recorded* (bit-and 0xFFFFFFFF recorded)
+        meth      (long (:compression-method cdr))
+        usize     (long (:uncompressed-size cdr))
+        csize     (long (:compressed-size cdr))
+        lfh-off   (+ (long (:relative-offset-local-header cdr)) extra-bytes)
+        nlen      (bit-and 0xFFFF (long (.getShort file-bb (int (+ lfh-off 26)))))
+        elen      (bit-and 0xFFFF (long (.getShort file-bb (int (+ lfh-off 28)))))
+        data-off  (+ lfh-off 30 nlen elen)
+        base      {:file-name name :recorded-crc recorded}]
+    (cond
+      (zero? usize)
+      (assoc base :status :empty)
+
+      (= 0 meth)
+      (try
+        (let [data (byte-array (int csize))]
+          (.position file-bb (int data-off))
+          (.get file-bb data)
+          (let [c        (doto (CRC32.) (.update data))
+                computed (.getValue c)]
+            (assoc base
+              :status       (if (= recorded* computed) :ok :mismatch)
+              :computed-crc computed)))
+        (catch Exception e
+          (assoc base :status :error :error (.getMessage e))))
+
+      (= 8 meth)
+      (let [compressed (byte-array (int csize))
+            inflater   (Inflater. true)]
+        (try
+          (.position file-bb (int data-off))
+          (.get file-bb compressed)
+          (.setInput inflater compressed)
+          (let [out    (byte-array (int usize))
+                ilen   (.inflate inflater out 0 (int usize))
+                c      (doto (CRC32.) (.update out 0 ilen))
+                computed (.getValue c)]
+            (assoc base
+              :status       (if (= recorded* computed) :ok :mismatch)
+              :computed-crc computed))
+          (catch Exception e
+            (assoc base :status :error :error (.getMessage e)))
+          (finally (.end inflater))))
+
+      :else
+      (assoc base :status :unsupported-method :method meth))))
+
+(defn verify-crcs
+  "Read every entry's compressed data from `f`, decompress it, and
+  compare the resulting CRC-32 against the value recorded in the
+  central directory. Returns a vector of maps, one per entry:
+
+      {:file-name    the entry name
+       :status       :ok | :mismatch | :empty | :unsupported-method | :error
+       :recorded-crc the recorded CRC-32 (signed long, as octet returns)
+       :computed-crc the computed CRC-32 (unsigned long; only present
+                      when actually computed)
+       :method       the compression method (only when :unsupported-method)
+       :error        the exception message (only when :error)}
+
+  Supports STORED (0) and DEFLATE (8) — the methods used by every
+  jar and the vast majority of zips. Other methods (BZIP2, LZMA,
+  etc.) yield `:unsupported-method` so the caller can decide whether
+  to treat that as a failure.
+
+  This is the strongest integrity check the library performs: it
+  verifies the data itself, not just the metadata."
+  [f]
+  (with-raf [r f "r"]
+    (let [len            (.length r)
+          ^ByteBuffer bb (map-region r "r" 0 len)
+          m              (zip-meta r {:decode false :include-locals false})
+          extra          (long (:extra-bytes m))]
+      (mapv #(compute-crc-for-entry bb (:record %) extra) (:cdr-records m)))))
+
+(defn verify-crcs-summary
+  "Run `verify-crcs` and return a map summarising the per-status
+  counts plus the entries (if any) whose CRC did not match:
+
+      {:total       N
+       :counts      {:ok N :mismatch N :empty N
+                     :unsupported-method N :error N}
+       :mismatches  [{...verify entry...} ...]
+       :errors      [{...} ...]
+       :valid?      true iff every non-skipped entry verified}"
+  [f]
+  (let [results (verify-crcs f)
+        counts  (frequencies (map :status results))
+        mis     (filterv #(= :mismatch (:status %)) results)
+        errs    (filterv #(= :error    (:status %)) results)]
+    {:total      (count results)
+     :counts     counts
+     :mismatches mis
+     :errors     errs
+     :valid?     (and (empty? mis) (empty? errs))}))
 
 (defn zip-comment
   "Return the archive-level comment from `f` (an empty string if
@@ -903,16 +1398,16 @@
     (when (> (alength cbytes) 0xFFFF)
       (throw (ex-info "zip comment exceeds the 65 535-byte maximum"
                       {:length (alength cbytes)})))
-    (let [m       (zip-meta f {:include-locals false})
+    (let [m       (zip-meta f {:include-locals false :decode false})
           {eo-off :offset eo :record} (:end-of-cdr-record m)
           new-eo  (assoc eo :zip-comment comment
                            :zip-comment-length (alength cbytes))
-          new-eo-size (long (ospec/size* rec-end-of-cdr new-eo))
+          new-eo-size (+ 22 (alength cbytes))
           new-len     (+ (long eo-off) new-eo-size)]
       (with-raf [r f "rw"]
         (.setLength r new-len)
         (let [^ByteBuffer bb (map-region r "rw" 0 new-len)]
-          (write-spec-bb! bb new-eo rec-end-of-cdr eo-off)
+          (write-eocdr! bb eo-off new-eo)
           (.force ^MappedByteBuffer bb))))
     f))
 

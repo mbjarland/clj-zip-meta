@@ -15,16 +15,24 @@ data; for that, use `java.util.zip.ZipFile` or libraries built on it.
 ## What it gives you
 
 * `zip-meta` — read every record in an archive and return it as a
-  plain Clojure map.
+  plain Clojure map. ~150× faster than the previous octet-based path
+  on realistic-size jars; records come with decoded convenience keys
+  (`:last-modified`, `:unix-mode`, `:dos-attributes`, `:directory?`,
+  `:encrypted?`, `:utf8-name?`, `:extra-fields`).
 * `zip-entries` — fast, CDR-only entry listing.
 * `find-entry` — look up an entry by name.
 * `zip-comment` / `set-zip-comment!` — read or rewrite the archive
   comment.
 * `summarize` — high-level statistics in a single map.
-* `validate-zip-meta` — check the metadata for self-consistency.
+* `validate-zip-meta` — check the metadata for self-consistency,
+  optionally including a CRC-32 pass over every entry's payload.
+* `verify-crcs` / `verify-crcs-summary` — decompress every entry and
+  check the data against its recorded CRC-32. The strongest integrity
+  check the library offers.
 * `repair-zip` — fix prepended-byte offset drift, strip preambles,
   or **rebuild a missing central directory from local file headers**.
-* A `lein run` CLI for the same operations from the shell.
+* A `lein run` CLI for the same operations from the shell, with
+  `--json` output for piping to `jq` or other tools.
 
 ## Why?
 
@@ -46,13 +54,22 @@ zip tools; `clj-zip-meta` repairs it.
 Leiningen / Boot:
 
 ```clojure
-[clj-zip-meta/clj-zip-meta "0.2.0"]
+[clj-zip-meta/clj-zip-meta "0.3.0"]
 ```
 
 deps.edn:
 
 ```clojure
-clj-zip-meta/clj-zip-meta {:mvn/version "0.2.0"}
+clj-zip-meta/clj-zip-meta {:mvn/version "0.3.0"}
+```
+
+The repo also ships a `deps.edn` with `:test`, `:cli`, and `:bench`
+aliases so contributors can work with tools.deps directly:
+
+```
+clj -M:test                    # run the test suite
+clj -M:cli -- list my.jar      # run the CLI
+clj -M:bench [PATH-TO-A-JAR]   # criterium benchmarks
 ```
 
 Requires Clojure 1.10+ and JDK 11+.
@@ -67,13 +84,18 @@ Requires Clojure 1.10+ and JDK 11+.
 
 ```clojure
 (z/zip-entries "my.jar")
-;;=> [{:file-name "META-INF/MANIFEST.MF"
-;;     :file-comment ""
-;;     :compressed-size 125
-;;     :uncompressed-size 167
-;;     :crc-32 -2096663765
+;;=> [{:file-name          "META-INF/MANIFEST.MF"
+;;     :file-comment       ""
+;;     :compressed-size    125
+;;     :uncompressed-size  167
+;;     :crc-32             -2096663765
 ;;     :compression-method 8
-;;     :offset 2286}
+;;     :offset             2286
+;;     :last-modified      #object[LocalDateTime "2024-09-05T19:05:00"]
+;;     :directory?         false
+;;     :encrypted?         false
+;;     :unix-mode          0100644
+;;     :dos-attributes     #{}}
 ;;    ...]
 
 (z/find-entry "my.jar" "META-INF/MANIFEST.MF")
@@ -86,6 +108,12 @@ Requires Clojure 1.10+ and JDK 11+.
 ;;    :total-uncompressed 5421
 ;;    :zip-comment ""}
 ```
+
+The raw on-disk fields (e.g. `:last-mod-file-time`,
+`:external-file-attributes`) are still present in `zip-meta`'s
+record maps — the decoded keys (`:last-modified`, `:unix-mode`,
+`:dos-attributes`, …) are layered on top. Pass `{:decode false}` to
+skip the decoration step when only the raw integers matter.
 
 ### Full metadata
 
@@ -140,7 +168,31 @@ noticeably faster on large jars:
 ;;=> {:valid? false
 ;;    :issues ["317 extra bytes at beginning or within zipfile"]
 ;;    :extra-bytes 317}
+
+;; Optionally include a CRC-32 pass over every entry's data:
+(z/validate-zip-meta "my.jar" :verify-crcs true)
 ```
+
+### CRC verification
+
+`verify-crcs` reads each entry's compressed payload, decompresses
+it, and compares the resulting CRC-32 against the value recorded
+in the central directory. It supports the STORED (0) and DEFLATE
+(8) compression methods — every jar and the vast majority of zips.
+
+```clojure
+(z/verify-crcs "my.jar")
+;;=> [{:file-name "META-INF/" :status :empty   :recorded-crc 0}
+;;    {:file-name "Foo.class" :status :ok      :recorded-crc -123 :computed-crc 4294967173}
+;;    {:file-name "Bar.class" :status :mismatch :recorded-crc 42  :computed-crc 99}]
+
+(z/verify-crcs-summary "my.jar")
+;;=> {:total 3 :counts {:empty 1 :ok 1 :mismatch 1}
+;;    :mismatches [{...}] :errors [] :valid? false}
+```
+
+This is the strongest integrity check the library performs — it
+verifies the data itself, not just the metadata.
 
 ### Repair
 
@@ -202,21 +254,33 @@ The library doubles as a CLI through `lein run`:
 
 ```
 $ lein run -- list my.jar
-    compressed   uncompressed name
-    ----------   ------------ ----
-             0              0 META-INF/
-           125            167 META-INF/MANIFEST.MF
-           412           1024 my/Foo.class
-$ lein run -- summary my.jar
-$ lein run -- validate my.jar
-$ lein run -- repair broken.jar
-$ lein run -- repair with-prelude.jar --strip
-$ lein run -- comment my.jar
-$ lein run -- comment my.jar "new archive comment"
+compressed  uncompressed  modified             name
+----------  ------------  --------             ----
+         0             0  2024-09-05T19:05     META-INF/
+       125           167  2024-09-05T19:05     META-INF/MANIFEST.MF
+       412          1024  2024-09-05T19:05     my/Foo.class
+
+$ lein run -- summary  my.jar
+$ lein run -- validate my.jar [--crc]
+$ lein run -- verify   my.jar
+$ lein run -- repair   broken.jar [--strip]
+$ lein run -- comment  my.jar
+$ lein run -- comment  my.jar "new archive comment"
 ```
 
-`lein uberjar` produces a self-contained `clj-zip-meta-<version>-standalone.jar`
-you can ship to a server and invoke with `java -jar`.
+Add `--json` to any read-only command for machine-readable output
+suitable for piping to `jq`:
+
+```
+$ lein run -- list my.jar --json | jq '.[].file-name'
+"META-INF/"
+"META-INF/MANIFEST.MF"
+"my/Foo.class"
+```
+
+`lein uberjar` produces a self-contained
+`clj-zip-meta-<version>-standalone.jar` you can ship to a server and
+invoke with `java -jar`.
 
 ## Detail: the zip data model
 
@@ -254,13 +318,17 @@ binary layer of zip files. Within that scope it is intended for
 production use:
 
 * Test coverage across reading, repairing, rebuilding from local
-  headers, and the CLI.
+  headers, CRC verification, and the CLI.
 * CI matrix across Clojure 1.10 / 1.11 / 1.12 on JDK 11 / 17 / 21.
 * `*warn-on-reflection*` enabled with the project compiling cleanly.
+* Hand-rolled record reader/writer puts the hot path squarely in
+  primitive `ByteBuffer` operations — `zip-meta` on a 4 MB / 3 770-entry
+  jar runs in ~25 ms (decoded) / 12 ms (raw).
 
 Out of scope (no current plans):
 
-* Zip64.
+* Zip64. Archives whose total size or per-entry size exceeds 4 GiB
+  will not round-trip.
 * Reading or decrypting encrypted entries.
 * Extracting entry data (use `java.util.zip.ZipFile`).
 

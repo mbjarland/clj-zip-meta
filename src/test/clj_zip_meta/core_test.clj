@@ -171,12 +171,13 @@
 (deftest zip-meta-can-skip-local-records
   (let [full (zm/zip-meta good-file)
         cdr  (zm/zip-meta good-file {:include-locals false})
-        ;; CDR records are read separately on each call so the byte
-        ;; arrays in :extra-field are distinct objects even with
-        ;; identical content. Compare on the comparable primitive
-        ;; fields instead.
+        ;; Byte arrays inside the records (`:extra-field` and
+        ;; `:extra-fields[*].data`) are distinct objects on each
+        ;; read even when their contents match. Drop them before
+        ;; comparing.
         scrub (fn [recs]
-                (mapv #(update % :record dissoc :extra-field) recs))]
+                (mapv #(update % :record dissoc :extra-field :extra-fields)
+                      recs))]
     (is (contains? full :local-records))
     (is (not (contains? cdr :local-records)))
     (is (= (scrub (:cdr-records full)) (scrub (:cdr-records cdr))))
@@ -189,6 +190,72 @@
     (zm/set-zip-comment! tmp "hello, comment!")
     (is (= "hello, comment!" (zm/zip-comment tmp)))
     (is (true? (:valid? (zm/validate-zip-meta tmp))))))
+
+(deftest round-trip-rewrite-preserves-everything
+  ;; A no-op repair-zip-with-preamble-bytes (extra-bytes = 0) should
+  ;; leave the file byte-identical, but more interestingly: a repair on
+  ;; an archive with preamble bytes should still produce something that
+  ;; zip-meta parses to a structurally identical CDR (same offsets and
+  ;; primitive fields) after the round trip.
+  (let [tmp     (copy-to-tmp bad-prelude-file "round-trip-")
+        before  (zm/zip-meta tmp {:decode false})]
+    (zm/repair-zip-with-preamble-bytes tmp)
+    (let [after (zm/zip-meta tmp {:decode false})]
+      (is (= 0 (:extra-bytes after)))
+      (is (= (count (:cdr-records before))
+             (count (:cdr-records after))))
+      ;; Primitive fields preserved (the offsets bumped by extra-bytes).
+      (let [extra 317]
+        (doseq [[b a] (map vector (:cdr-records before) (:cdr-records after))]
+          (let [br (:record b) ar (:record a)]
+            (is (= (:file-name br)         (:file-name ar)))
+            (is (= (:crc-32 br)            (:crc-32 ar)))
+            (is (= (:compressed-size br)   (:compressed-size ar)))
+            (is (= (:uncompressed-size br) (:uncompressed-size ar)))
+            (is (= (+ extra (long (:relative-offset-local-header br)))
+                   (:relative-offset-local-header ar)))))))))
+
+(deftest verify-crcs-passes-on-intact-archive
+  (let [results (zm/verify-crcs good-file)
+        summary (zm/verify-crcs-summary good-file)]
+    (is (every? #{:ok :empty} (map :status results)))
+    (is (true? (:valid? summary)))
+    (is (zero? (count (:mismatches summary))))))
+
+(deftest cdr-records-have-decoded-convenience-keys
+  (let [recs (->> (zm/zip-meta good-file) :cdr-records (mapv :record))
+        dir  (first (filter :directory? recs))
+        file (first (remove :directory? recs))]
+    (testing "every record has the decode-augmented keys"
+      (doseq [r recs]
+        (is (some? (:last-modified r)))
+        (is (set? (:dos-attributes r)))
+        (is (contains? r :unix-mode))
+        (is (contains? r :directory?))
+        (is (contains? r :encrypted?))
+        (is (contains? r :utf8-name?))
+        (is (vector? (:extra-fields r)))))
+    (testing "directory entry is recognised"
+      (is (true? (:directory? dir)))
+      (is (contains? (:dos-attributes dir) :directory)))
+    (testing "unix-mode decoded as expected octal"
+      (is (= 040755 (:unix-mode dir))) ; rwxr-xr-x directory
+      (is (= 0100644 (:unix-mode file))))
+    (testing "non-archive comment, non-encrypted, ASCII"
+      (is (false? (:encrypted? file)))
+      (is (false? (:utf8-name? file))))
+    (testing "extended-timestamp extra-field is decoded"
+      (let [ts (some #(when (= :extended-timestamp (:tag-name %)) %)
+                     (:extra-fields file))]
+        (is (some? ts))
+        (is (integer? (-> ts :decoded :mtime)))))))
+
+(deftest zip-meta-decode-false-skips-decoration
+  (let [r (first (:cdr-records (zm/zip-meta good-file {:decode false})))]
+    (is (not (contains? (:record r) :last-modified)))
+    (is (not (contains? (:record r) :dos-attributes)))
+    (is (not (contains? (:record r) :unix-mode)))
+    (is (not (contains? (:record r) :extra-fields)))))
 
 (deftest set-zip-comment-rejects-over-65535-bytes
   (let [tmp (copy-to-tmp good-file "comment-big-")]
@@ -221,6 +288,41 @@
   (let [path (write-test-zip {"alpha.txt" "a" "beta.txt" "b" "gamma.txt" "g"})]
     (is (= "beta.txt" (:file-name (zm/find-entry path "beta.txt"))))
     (is (nil? (zm/find-entry path "nope.txt")))))
+
+(deftest verify-crcs-detects-tampering
+  ;; Build a real zip, then flip a byte inside the compressed payload
+  ;; of one entry. The CRC should no longer match.
+  (let [path (write-test-zip {"hello.txt" "the quick brown fox jumps over the lazy dog"
+                              "two.txt"   "two"})
+        m    (zm/zip-meta path)
+        ;; ZipOutputStream uses data descriptors, so the LFH carries
+        ;; zero sizes. Use the CDR's authoritative :compressed-size
+        ;; and pair it with the matching LFH offset from
+        ;; :local-records.
+        cdr-rec (first (filter #(pos? (long (-> % :record :compressed-size)))
+                                (:cdr-records m)))
+        cdr     (:record cdr-rec)
+        lfh-rec (some #(when (= (-> % :record :file-name) (:file-name cdr)) %)
+                       (:local-records m))
+        lfh     (:record lfh-rec)
+        data-off (+ (long (:offset lfh-rec))
+                    30
+                    (bit-and 0xFFFF (long (:file-name-length lfh)))
+                    (bit-and 0xFFFF (long (:extra-field-length lfh))))]
+    (with-open [r (RandomAccessFile. path "rw")]
+      (.seek r data-off)
+      (let [b (.readByte r)]
+        (.seek r data-off)
+        (.writeByte r (bit-xor (int b) 0xFF))))
+    (let [results (zm/verify-crcs path)
+          summary (zm/verify-crcs-summary path)]
+      (is (false? (:valid? summary)))
+      ;; Flipping a byte inside a deflate stream usually makes the
+      ;; stream itself unparseable, which surfaces as :error from the
+      ;; inflater. On the off chance the bit happens to land in a
+      ;; non-load-bearing position the bytes still inflate but the
+      ;; CRC will mismatch. Either outcome counts as detection.
+      (is (some #(contains? #{:mismatch :error} (:status %)) results)))))
 
 (deftest creates-and-parses-a-test-zip
   (let [path (write-test-zip {"a.txt" "alpha" "b.txt" "bravo"})
