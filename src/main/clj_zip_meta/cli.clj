@@ -21,13 +21,15 @@
     "Usage: clj-zip-meta COMMAND FILE [args...]"
     ""
     "Commands:"
-    "  list      FILE                List entries (name, compressed, uncompressed)"
-    "  meta      FILE                Pretty-print the full metadata map"
-    "  summary   FILE                Print a high-level summary"
-    "  comment   FILE [new-comment]  Print or set the archive comment"
-    "  validate  FILE [--crc]        Check metadata (and optionally CRC-32)"
-    "  verify    FILE                Decompress every entry and check CRC-32"
-    "  repair    FILE [--strip]      Repair offset drift or rebuild a missing CDR"
+    "  list      FILE [--match PAT]      List entries; optional regex/substring filter"
+    "  meta      FILE                    Pretty-print the full metadata map"
+    "  summary   FILE                    Print a high-level summary"
+    "  comment   FILE [new-comment]      Print or set the archive comment"
+    "  validate  FILE [--crc]            Check metadata (and optionally CRC-32)"
+    "  verify    FILE                    Decompress every entry and check CRC-32"
+    "  repair    FILE [--strip]          Repair offset drift or rebuild a missing CDR"
+    "  diff      FILE-A FILE-B           Compare two archives by file-name + CRC"
+    "  hexdump   FILE OFFSET [LENGTH]    Dump bytes around a record offset"
     ""
     "Global flags:"
     "  --json     Emit JSON on stdout instead of human-readable text"
@@ -105,8 +107,17 @@
 
 ;; --- commands -------------------------------------------------------------
 
-(defn- list-entries [f json?]
-  (let [entries (zm/zip-entries f)]
+(defn- list-entries [f flags json?]
+  (let [match   (loop [xs flags]
+                  (cond
+                    (empty? xs)        nil
+                    (= "--match" (first xs)) (second xs)
+                    :else              (recur (rest xs))))
+        ;; Substring by default; if the pattern looks regex-y, compile it.
+        match*  (when match
+                  (try (re-pattern match)
+                       (catch Exception _ match)))
+        entries (zm/zip-entries f (cond-> {} match* (assoc :match match*)))]
     (emit json?
           (fn []
             (print-table ["compressed" "uncompressed" "modified" "name"]
@@ -167,6 +178,44 @@
           s)
     (when-not (:valid? s) (System/exit 1))))
 
+(defn- diff-cmd [a b json?]
+  (let [d (zm/diff a b)]
+    (emit json?
+          (fn []
+            (let [{:keys [added removed changed same]} d]
+              (println (str "same:    " same))
+              (when (seq added)
+                (println (str "added (" (count added) "):"))
+                (doseq [e added]
+                  (println (format "  + %14d  %s"
+                                   (:uncompressed-size e) (:file-name e)))))
+              (when (seq removed)
+                (println (str "removed (" (count removed) "):"))
+                (doseq [e removed]
+                  (println (format "  - %14d  %s"
+                                   (:uncompressed-size e) (:file-name e)))))
+              (when (seq changed)
+                (println (str "changed (" (count changed) "):"))
+                (doseq [{:keys [file-name before after]} changed]
+                  (println (format "  ~ %s" file-name))
+                  (println (format "      before: csize=%d usize=%d crc=%d"
+                                   (:compressed-size before)
+                                   (:uncompressed-size before)
+                                   (:crc-32 before)))
+                  (println (format "      after:  csize=%d usize=%d crc=%d"
+                                   (:compressed-size after)
+                                   (:uncompressed-size after)
+                                   (:crc-32 after)))))))
+          d)
+    (when (or (seq (:added d)) (seq (:removed d)) (seq (:changed d)))
+      (System/exit 2))))
+
+(defn- hexdump-cmd [f offset length json?]
+  (let [off (Long/parseLong offset)
+        len (if length (Long/parseLong length) 256)
+        s   (zm/hexdump f off len)]
+    (emit json? #(print s) {:offset off :length len :hex s})))
+
 (defn- repair-cmd [f flags json?]
   (let [strip? (contains? (set flags) "--strip")
         r      (zm/repair-zip f {:strip-preamble strip?})]
@@ -191,13 +240,15 @@
         args  (remove #(= "--json" %) args)
         [cmd file & rest] args]
     (case cmd
-      "list"     (list-entries file json?)
+      "list"     (list-entries file rest json?)
       "meta"     (print-meta file json?)
       "summary"  (print-summary file json?)
       "comment"  (comment-cmd file (first rest) json?)
       "validate" (validate-cmd file rest json?)
       "verify"   (verify-cmd file json?)
       "repair"   (repair-cmd file rest json?)
+      "diff"     (diff-cmd file (first rest) json?)
+      "hexdump"  (hexdump-cmd file (first rest) (second rest) json?)
       (do (println usage)
           (flush)
           (System/exit (if cmd 1 0))))))

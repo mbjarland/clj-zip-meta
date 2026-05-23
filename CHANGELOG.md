@@ -13,6 +13,19 @@ and the format of [keepachangelog.com](https://keepachangelog.com/).
   `clj-zip-meta.core` and the CLI (`clj-zip-meta.cli`) now run under
   [Babashka](https://babashka.org/) — no JVM required. A `bb.edn` is
   bundled. Try `bb -m clj-zip-meta.cli list my.jar`.
+- `zip-entries` accepts an options map with `:match`, which keeps
+  only entries whose `:file-name` matches a regex `Pattern`, a
+  substring `String`, or a predicate function. CLI `list FILE
+  --match PAT` exposes this.
+- `diff a b` — compare two archives by file-name and report which
+  entries are added, removed, or changed (CRC / size differences),
+  plus a count of identical entries. Exposed as `diff FILE-A FILE-B`
+  on the CLI; exits 2 if any difference is found.
+- `hexdump f offset [length]` — classic hex-dump view of `length`
+  bytes (default 256) starting at byte offset `offset`. Useful when
+  staring at a specific record's raw bytes during a repair
+  investigation. Exposed as `hexdump FILE OFFSET [LENGTH]` on the
+  CLI.
 
 ### Changed (breaking)
 - `read-spec-from-buffer`, `read-spec-from-file`,

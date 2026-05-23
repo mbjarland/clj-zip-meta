@@ -19,8 +19,13 @@ data; for that, use `java.util.zip.ZipFile` or libraries built on it.
   on realistic-size jars; records come with decoded convenience keys
   (`:last-modified`, `:unix-mode`, `:dos-attributes`, `:directory?`,
   `:encrypted?`, `:utf8-name?`, `:extra-fields`).
-* `zip-entries` — fast, CDR-only entry listing.
+* `zip-entries` — fast, CDR-only entry listing, with an optional
+  `:match` filter (regex, substring, or predicate).
 * `find-entry` — look up an entry by name.
+* `diff` — compare two archives entry-by-entry; reports
+  added / removed / changed (CRC or size).
+* `hexdump` — render the bytes around a record offset as a classic
+  hex dump for repair investigations.
 * `zip-comment` / `set-zip-comment!` — read or rewrite the archive
   comment.
 * `summarize` — high-level statistics in a single map.
@@ -287,6 +292,9 @@ $ lein run -- verify   my.jar
 $ lein run -- repair   broken.jar [--strip]
 $ lein run -- comment  my.jar
 $ lein run -- comment  my.jar "new archive comment"
+$ lein run -- list     my.jar --match '\.class$'
+$ lein run -- diff     old.jar new.jar
+$ lein run -- hexdump  my.jar 2231 64
 ```
 
 Add `--json` to any read-only command for machine-readable output

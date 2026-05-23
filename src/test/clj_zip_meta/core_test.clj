@@ -289,6 +289,52 @@
     (is (= "beta.txt" (:file-name (zm/find-entry path "beta.txt"))))
     (is (nil? (zm/find-entry path "nope.txt")))))
 
+(deftest zip-entries-match-filter
+  (let [path (write-test-zip {"alpha.txt"   "a"
+                              "beta.txt"    "b"
+                              "gamma.json"  "g"
+                              "delta.json"  "d"})]
+    (testing "regex pattern"
+      (is (= #{"alpha.txt" "beta.txt"}
+             (->> (zm/zip-entries path {:match #"\.txt$"})
+                  (map :file-name) set))))
+    (testing "substring"
+      (is (= #{"delta.json" "gamma.json"}
+             (->> (zm/zip-entries path {:match "json"})
+                  (map :file-name) set))))
+    (testing "function predicate"
+      (is (= #{"alpha.txt" "beta.txt" "gamma.json" "delta.json"}
+             (->> (zm/zip-entries path {:match (constantly true)})
+                  (map :file-name) set))))
+    (testing "no match returns empty"
+      (is (= [] (zm/zip-entries path {:match "nope"}))))
+    (testing "nil match is the same as no option"
+      (is (= 4 (count (zm/zip-entries path {:match nil})))))))
+
+(deftest diff-detects-added-removed-changed
+  (let [a    (write-test-zip {"keep.txt"   "alpha"
+                              "drop.txt"   "this entry vanishes"
+                              "change.txt" "before"})
+        b    (write-test-zip {"keep.txt"   "alpha"
+                              "added.txt"  "brand new"
+                              "change.txt" "after differs"})
+        d    (zm/diff a b)
+        names (fn [k] (set (map :file-name (k d))))]
+    (is (= #{"added.txt"} (names :added)))
+    (is (= #{"drop.txt"}  (names :removed)))
+    (is (= #{"change.txt"} (set (map :file-name (:changed d)))))
+    (is (= 1 (:same d)))
+    (let [c (first (:changed d))]
+      (is (= "change.txt" (:file-name c)))
+      (is (not= (:crc-32 (:before c)) (:crc-32 (:after c)))))))
+
+(deftest hexdump-renders-classic-layout
+  (let [s (zm/hexdump good-file 0 32)]
+    (is (re-find #"^00000000  50 4b" s))
+    (is (re-find #"\|PK" s))
+    ;; Two rows for 32 bytes, then a trailing newline.
+    (is (= 2 (count (filter #(= % \newline) s))))))
+
 (deftest verify-crcs-detects-tampering
   ;; Build a real zip, then flip a byte inside the compressed payload
   ;; of one entry. The CRC should no longer match.

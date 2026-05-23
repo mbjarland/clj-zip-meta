@@ -1194,6 +1194,19 @@
 ;; ============================================================================
 ;; Convenience / ergonomic API
 
+(defn- entry-matcher
+  "Turn the value of `:match` into a predicate over file-name strings.
+  Accepts a `java.util.regex.Pattern`, a substring `String`, a
+  function, or `nil` (match everything)."
+  [match]
+  (cond
+    (nil? match)         (constantly true)
+    (instance? java.util.regex.Pattern match) #(boolean (re-find match %))
+    (string? match)      #(boolean (and % (str/includes? % match)))
+    (fn? match)          match
+    :else (throw (ex-info ":match must be a Pattern, String, fn, or nil"
+                          {:match match}))))
+
 (defn zip-entries
   "Return a vector of compact entry summaries for `f`, one per central
   directory record. Each entry has the keys:
@@ -1212,29 +1225,116 @@
     `:dos-attributes`      — set of DOS-attribute keywords
 
   Reads only the central directory — much faster than `zip-meta` for
-  archives with many entries when local file headers are not needed."
-  [f]
-  (mapv
-    (fn [{offset :offset cdr :record}]
-      {:file-name          (:file-name cdr)
-       :file-comment       (:file-comment cdr)
-       :compressed-size    (:compressed-size cdr)
-       :uncompressed-size  (:uncompressed-size cdr)
-       :crc-32             (:crc-32 cdr)
-       :compression-method (:compression-method cdr)
-       :offset             offset
-       :directory?         (:directory? cdr)
-       :encrypted?         (:encrypted? cdr)
-       :last-modified      (:last-modified cdr)
-       :unix-mode          (:unix-mode cdr)
-       :dos-attributes     (:dos-attributes cdr)})
-    (:cdr-records (zip-meta f {:include-locals false}))))
+  archives with many entries when local file headers are not needed.
+
+  Options:
+    `:match` — keep only entries whose `:file-name` matches. May be a
+                `java.util.regex.Pattern`, a substring `String`, or a
+                function `(fn [file-name] ...)`. Defaults to nil
+                (match everything)."
+  ([f] (zip-entries f {}))
+  ([f {:keys [match]}]
+   (let [pred (entry-matcher match)]
+     (into []
+           (comp
+             (map (fn [{offset :offset cdr :record}]
+                    {:file-name          (:file-name cdr)
+                     :file-comment       (:file-comment cdr)
+                     :compressed-size    (:compressed-size cdr)
+                     :uncompressed-size  (:uncompressed-size cdr)
+                     :crc-32             (:crc-32 cdr)
+                     :compression-method (:compression-method cdr)
+                     :offset             offset
+                     :directory?         (:directory? cdr)
+                     :encrypted?         (:encrypted? cdr)
+                     :last-modified      (:last-modified cdr)
+                     :unix-mode          (:unix-mode cdr)
+                     :dos-attributes     (:dos-attributes cdr)}))
+             (filter (fn [e] (pred (:file-name e)))))
+           (:cdr-records (zip-meta f {:include-locals false}))))))
 
 (defn find-entry
   "Find the entry whose `:file-name` equals `file-name`. Returns the
   compact summary map (see `zip-entries`) or `nil` if not found."
   [f file-name]
   (some #(when (= (:file-name %) file-name) %) (zip-entries f)))
+
+(defn diff
+  "Compare two archives by file-name. Returns a map describing the
+  differences:
+
+    `:added`    — vector of entries in `b` but not in `a`
+    `:removed`  — vector of entries in `a` but not in `b`
+    `:changed`  — vector of `{:file-name N :before E :after E}` for
+                  entries whose CRC, compressed-size or
+                  uncompressed-size differ between the two archives
+    `:same`     — number of entries present in both archives with
+                  identical CRC and sizes
+
+  Useful for answering \"did this jar actually change?\" — for
+  instance comparing the artifact a build produced today against
+  yesterday's."
+  [a b]
+  (let [as       (zip-entries a)
+        bs       (zip-entries b)
+        a-by-nm  (into {} (map (juxt :file-name identity)) as)
+        b-by-nm  (into {} (map (juxt :file-name identity)) bs)
+        a-names  (set (keys a-by-nm))
+        b-names  (set (keys b-by-nm))
+        only-a   (sort (remove b-names a-names))
+        only-b   (sort (remove a-names b-names))
+        both     (sort (filter a-names b-names))
+        same?    (fn [ea eb]
+                   (and (= (:crc-32 ea)            (:crc-32 eb))
+                        (= (:compressed-size ea)   (:compressed-size eb))
+                        (= (:uncompressed-size ea) (:uncompressed-size eb))))]
+    {:added   (mapv b-by-nm only-b)
+     :removed (mapv a-by-nm only-a)
+     :changed (vec
+                (for [n     both
+                      :let  [ea (get a-by-nm n)
+                             eb (get b-by-nm n)]
+                      :when (not (same? ea eb))]
+                  {:file-name n :before ea :after eb}))
+     :same    (count (filter (fn [n] (same? (a-by-nm n) (b-by-nm n))) both))}))
+
+(defn hexdump
+  "Return a classic hex-dump string of `length` bytes starting at byte
+  offset `offset` in file `f`. Output rows look like:
+
+      00000000  50 4b 03 04 14 00 00 00  08 00 00 00 00 00 00 00  |PK..............|
+
+  Useful for debugging when you have a record offset (from `zip-meta`)
+  and want to eyeball the surrounding bytes. `length` defaults to 256."
+  ([f offset] (hexdump f offset 256))
+  ([f offset length]
+   (with-raf [r f "r"]
+     (let [file-len (.length r)
+           start    (long offset)
+           want     (min (long length) (- file-len start))
+           buf      (byte-array (int want))]
+       (.seek r start)
+       (.readFully r buf 0 (int want))
+       (let [sb (StringBuilder.)]
+         (loop [i 0]
+           (when (< i want)
+             (.append sb (format "%08x  " (+ start i)))
+             (dotimes [j 16]
+               (cond
+                 (< (+ i j) want)
+                 (do (.append sb (format "%02x " (bit-and 0xFF (long (aget buf (int (+ i j)))))))
+                     (when (= j 7) (.append sb " ")))
+
+                 (= j 7) (.append sb "    ")
+                 :else   (.append sb "   ")))
+             (.append sb " |")
+             (dotimes [j 16]
+               (when (< (+ i j) want)
+                 (let [b (bit-and 0xFF (long (aget buf (int (+ i j)))))]
+                   (.append sb (if (and (<= 0x20 b) (<= b 0x7E)) (char b) \.)))))
+             (.append sb "|\n")
+             (recur (+ i 16))))
+         (.toString sb))))))
 
 ;; ----------------------------------------------------------------------------
 ;; CRC verification
