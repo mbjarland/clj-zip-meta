@@ -24,7 +24,8 @@
              :1.12     {:dependencies [[org.clojure/clojure "1.12.0"]]}
              :bench    {:source-paths ["bench"]
                         :dependencies [[criterium/criterium "0.4.6"]]
-                        :main         clj-zip-meta.bench}}
+                        :main         clj-zip-meta.bench}
+             :uberjar  {:aot :all}}
 
   :aliases {"test-all" ["with-profile" "+1.10:+1.11:+1.12" "test"]
             "bench"    ["with-profile" "+bench" "run"]}

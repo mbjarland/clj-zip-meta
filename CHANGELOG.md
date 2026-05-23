@@ -34,6 +34,15 @@ and the format of [keepachangelog.com](https://keepachangelog.com/).
 - `zero-timestamps! f` — clear `:last-mod-file-time` and
   `:last-mod-file-date` on every CDR record (a step toward
   reproducible-build archives).
+- `:symlink?` convenience boolean on CDR records (Unix file-type
+  bits == 0o120000).
+- NTFS extra-field decoder (tag 0x000A): surfaces `:mtime`,
+  `:atime`, `:ctime` as UTC LocalDateTime values when present.
+- PKWARE Unix extra-field decoder (tag 0x000D): surfaces `:atime`,
+  `:mtime`, `:uid`, `:gid`.
+- `doc/cljdoc.edn` so [cljdoc.org](https://cljdoc.org/) renders the
+  README, intro, changelog, and contributor guide as navigation
+  entries on the published docs site.
 
 ### Changed (breaking)
 - `read-spec-from-buffer`, `read-spec-from-file`,
