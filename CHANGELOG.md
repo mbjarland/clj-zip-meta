@@ -6,6 +6,33 @@ and the format of [keepachangelog.com](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-05-23
+
+### Fixed
+- CLI column alignment when a cell carried an ANSI colour escape
+  sequence. The previous helpers used `format` "%-Ns" padding which
+  counts every character — including escape codes — so coloured
+  cells lost their padding and adjacent rows drifted. Added
+  visible-length-aware `pad-left` / `pad-right` and routed every
+  column-aligned spot through them. `verify`, `analyze`, `repair`,
+  `diff`, `duplicate-classes`, etc. now line up regardless of colour.
+- `validate FILE --crc` threw a `ClassCastException`: the
+  `validate-zip-meta` arglist shadowed the `verify-crcs` function
+  with its `:verify-crcs` keyword option. Renamed the local binding
+  and added a forward `declare`.
+- `analyze FILE --recursive` reported `safe? yes / SAFE` even when
+  a nested archive carried unsafe entries. The verdict now ANDs the
+  top-level result with every nested archive.
+- `inspect`: `unix-mode` and other nullable fields were silently
+  dropped by the kv-block's nil filter. They now show as `(none)`.
+- `diff`: hardcoded `%14s` size column with no ANSI awareness. Now
+  dynamically sized and right-aligned via `pad-left`.
+
+### Added
+- `CLICOLOR_FORCE=1` env var forces colour on even when stdout
+  isn't a TTY (de facto Unix convention; handy for piping through
+  `less -R` or capturing styled output).
+
 ## [0.5.1] - 2026-05-23
 
 ### Changed
@@ -301,7 +328,8 @@ and the format of [keepachangelog.com](https://keepachangelog.com/).
   local file headers from zip/jar files; repair offsets after prepending
   preamble bytes.
 
-[Unreleased]: https://github.com/mbjarland/clj-zip-meta/compare/0.5.1...HEAD
+[Unreleased]: https://github.com/mbjarland/clj-zip-meta/compare/0.5.2...HEAD
+[0.5.2]: https://github.com/mbjarland/clj-zip-meta/compare/0.5.1...0.5.2
 [0.5.1]: https://github.com/mbjarland/clj-zip-meta/compare/0.5.0...0.5.1
 [0.5.0]: https://github.com/mbjarland/clj-zip-meta/compare/0.4.0...0.5.0
 [0.4.0]: https://github.com/mbjarland/clj-zip-meta/compare/0.3.0...0.4.0
