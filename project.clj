@@ -1,4 +1,4 @@
-(defproject clj-zip-meta/clj-zip-meta "0.5.0"
+(defproject clj-zip-meta/clj-zip-meta "0.5.1"
   :description "A Clojure library for reading and patching the binary
                 metadata of zip and jar files (local file headers, central
                 directory headers, end-of-central-directory record)."

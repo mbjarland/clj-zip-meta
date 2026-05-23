@@ -1520,7 +1520,11 @@
 (defn print-layout
   "Pretty-print the layout of `f` as a one-line-per-region table.
   Pass `:width N` to also draw a width-`N` ASCII byte-map (each char
-  represents `file-size / N` bytes) above the table."
+  represents `file-size / N` bytes) above the table.
+
+  Numeric columns are right-aligned; the table is sized to the
+  widest cell in each column so big archives don't waste horizontal
+  space with leading zeros."
   ([f] (print-layout f {}))
   ([f {:keys [width] :or {width 0}}]
    (let [regs   (layout f)
@@ -1531,7 +1535,10 @@
                  :data-descriptor \d
                  :cdr             \C
                  :eocdr           \E
-                 :gap             \-}]
+                 :gap             \-}
+         max-w  (fn [col]
+                  (apply max 0 (map #(count (str (or (col %) ""))) regs)))
+         fmt-num* (fn [n] (format "%,d" (long n)))]
      (when (pos? width)
        (let [bytes-per-char (max 1 (quot flen width))
              cells          (char-array width \space)]
@@ -1543,16 +1550,25 @@
                  (aset-char cells i (get kchar (:kind r) \?))
                  (recur (inc i))))))
          (println (str "|" (String. cells) "|  "
-                       bytes-per-char " bytes/char"))
+                       (fmt-num* bytes-per-char) " bytes/char"))
          (println "  P=preamble L=LFH D=data d=descriptor C=CDR E=EOCDR -=gap")
          (println)))
-     (printf "%-16s %-16s %-10s %-18s %s%n"
-             "start" "end" "length" "kind" "file-name")
-     (printf "%-16s %-16s %-10s %-18s %s%n"
-             "-----" "---" "------" "----" "---------")
-     (doseq [{:keys [start end length kind file-name]} regs]
-       (printf "%-16d %-16d %-10d %-18s %s%n"
-               start end length (name kind) (or file-name ""))))))
+     (let [;; Use formatted (comma-separated) numbers for width-calculation.
+           start-w  (apply max 5 (map #(count (fmt-num* (:start %)))  regs))
+           end-w    (apply max 3 (map #(count (fmt-num* (:end %)))    regs))
+           len-w    (apply max 6 (map #(count (fmt-num* (:length %))) regs))
+           kind-w   (apply max 4 (map #(count (name (:kind %)))       regs))]
+       (println (format (str "%" start-w "s  %" end-w "s  %" len-w "s  %-" kind-w "s  %s")
+                        "start" "end" "length" "kind" "file-name"))
+       (println (str (apply str (repeat start-w \─)) "  "
+                     (apply str (repeat end-w \─))   "  "
+                     (apply str (repeat len-w \─))   "  "
+                     (apply str (repeat kind-w \─)) "  "
+                     (apply str (repeat 9 \─))))
+       (doseq [{:keys [start end length kind file-name]} regs]
+         (printf (str "%" start-w "s  %" end-w "s  %" len-w "s  %-" kind-w "s  %s%n")
+                 (fmt-num* start) (fmt-num* end) (fmt-num* length)
+                 (name kind) (or file-name "")))))))
 
 (defn diff
   "Compare two archives by file-name. Returns a map describing the

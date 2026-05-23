@@ -8,11 +8,11 @@
             [clj-zip-meta.core :as zm]
             [clojure.java.io :as jio]
             [clojure.pprint :as pp]
-            [clojure.string :as str]
-            [clojure.walk :as walk])
+            [clojure.string :as str])
+  (:import (java.io File))
   (:gen-class))
 
-(def ^:private version "0.5.0")
+(def ^:private version "0.5.1")
 
 (def ^:private usage
   (str/join
@@ -21,35 +21,144 @@
     ""
     "Usage: clj-zip-meta COMMAND FILE [args...]"
     ""
-    "Commands:"
+    "Read & explore"
     "  list      FILE [--match PAT]      List entries; optional regex/substring filter"
     "  tree      FILE [--match PAT]      Show entries as a directory tree"
-    "  manifest  FILE                    Parse META-INF/MANIFEST.MF (jars)"
-    "  jar-info  FILE                    High-level jar info (Main-Class, version, …)"
-    "  describe  FILE                    What is this jar? (manifest + pom + counts)"
-    "  classes   FILE                    .class entries grouped by Java package"
-    "  spi       FILE                    META-INF/services providers (SPI)"
-    "  duplicate-classes FILE FILE ...   Class names declared by more than one jar"
+    "  grep      FILE PATTERN            Print entry names matching PATTERN"
+    "  inspect   FILE ENTRY              Pretty-print everything about one entry"
     "  cat       FILE ENTRY              Extract one entry to stdout"
     "  meta      FILE                    Pretty-print the full metadata map"
     "  summary   FILE                    Print a high-level summary"
-    "  inspect   FILE ENTRY-NAME         Pretty-print everything about one entry"
-    "  grep      FILE PATTERN            Print entry names matching PATTERN"
-    "  comment   FILE [new-comment]      Print or set the archive comment"
+    "  layout    FILE [--width N]        Show the physical layout of records"
+    "  hexdump   FILE OFFSET [LENGTH]    Dump bytes around a record offset"
+    ""
+    "Jar understanding"
+    "  describe  FILE                    What is this jar? (manifest + pom + counts)"
+    "  manifest  FILE                    Parse META-INF/MANIFEST.MF"
+    "  jar-info  FILE                    Distilled jar info (Main-Class, version, …)"
+    "  classes   FILE [--all]            .class entries grouped by Java package"
+    "  spi       FILE                    META-INF/services providers (SPI)"
+    "  duplicate-classes FILE FILE ...   Class names declared by more than one jar"
+    ""
+    "Integrity & safety"
     "  validate  FILE [--crc]            Check metadata (and optionally CRC-32)"
     "  verify    FILE                    Decompress every entry and check CRC-32"
-    "  repair    FILE [--strip]          Repair offset drift or rebuild a missing CDR"
+    "  analyze   FILE [--recursive]      Safety / forensics checks"
     "  diff      FILE-A FILE-B           Compare two archives by file-name + CRC"
-    "  layout    FILE [--width N]        Show the physical layout of records in FILE"
-    "  hexdump   FILE OFFSET [LENGTH]    Dump bytes around a record offset"
-    "  analyze   FILE [--recursive]      Run safety / forensics checks"
     ""
-    "Global flags:"
-    "  --json     Emit JSON on stdout instead of human-readable text"
-    "  --version  Print the library version and exit"
+    "Modify"
+    "  comment   FILE [NEW-COMMENT]      Print or set the archive comment"
+    "  repair    FILE [--strip]          Repair offset drift or rebuild a missing CDR"
+    ""
+    "Global flags"
+    "  --json       Emit JSON on stdout instead of human-readable text"
+    "  --no-color   Disable ANSI colour codes"
+    "  --version    Print the library version and exit"
     ""]))
 
-;; --- minimal JSON emitter -------------------------------------------------
+;; ============================================================================
+;; TUI primitives
+
+(def ^:dynamic ^:private *color?* false)
+
+(defn- ansi [code s]
+  (if *color?* (str "[" code "m" s "[0m") (str s)))
+
+(defn- bold   [s] (ansi "1"  s))
+(defn- dim    [s] (ansi "2"  s))
+(defn- red    [s] (ansi "31" s))
+(defn- green  [s] (ansi "32" s))
+(defn- yellow [s] (ansi "33" s))
+(defn- cyan   [s] (ansi "36" s))
+
+(defn- fmt-num
+  "Integer with comma-thousands separators (e.g. 3,770)."
+  [n]
+  (if (number? n) (format "%,d" (long n)) (str n)))
+
+(defn- path-short
+  "Trim a file path for display: keep filename only when run in a
+  modern terminal, full path in JSON output."
+  [^String p]
+  (.getName (jio/file p)))
+
+(defn- title
+  "Print a one-line bold command title."
+  [cmd path]
+  (println (bold (str cmd "  " (path-short path)))))
+
+(defn- subtitle
+  "Print a dim header inside a command's body."
+  [s]
+  (println)
+  (println (dim s)))
+
+(defn- numeric? [v]
+  (or (number? v)
+      (and (string? v) (re-matches #"-?\d+(?:,\d{3})*" v))))
+
+(defn- max-width [strs]
+  (apply max 0 (map #(count (str %)) strs)))
+
+(defn- kv-block
+  "Print a block of `[label value]` pairs with consistent
+  alignment. Numeric values are right-aligned when the entire block
+  is numeric; otherwise values are left-aligned. Pairs whose value
+  is nil are skipped."
+  ([pairs] (kv-block 2 pairs))
+  ([indent pairs]
+   (let [pairs    (remove (fn [[_ v]] (nil? v)) pairs)
+         labels   (map (comp str first)  pairs)
+         vals     (map (comp str second) pairs)
+         lw       (max-width labels)
+         all-num? (and (seq pairs) (every? numeric? (map second pairs)))
+         vw       (when all-num? (max-width vals))
+         pad      (apply str (repeat indent \space))]
+     (doseq [[l v] pairs]
+       (let [vs (str v)]
+         (if all-num?
+           (println (format (str pad "%-" lw "s  %" vw "s") l vs))
+           (println (format (str pad "%-" lw "s  %s")       l vs))))))))
+
+(defn- print-table
+  "Print a table with `headers` and `rows`. Numeric columns
+  right-align, text columns left-align. Header row is dim, separator
+  is a light horizontal rule."
+  [headers rows]
+  (let [ncols     (count headers)
+        col-vals  (mapv (fn [i] (map #(nth % i) rows)) (range ncols))
+        col-num?  (mapv (fn [vs] (and (seq vs) (every? #(or (nil? %) (number? %)) vs))) col-vals)
+        widths    (mapv (fn [i]
+                          (apply max (count (str (nth headers i)))
+                                 (map #(count (str (or (nth % i) ""))) rows)))
+                        (range ncols))
+        cell-fmt  (mapv (fn [w n?] (if n? (str "%" w "s") (str "%-" w "s")))
+                        widths col-num?)
+        hdr-fmt   (->> widths (map #(str "%-" % "s")) (str/join "  "))
+        row-fmt   (str/join "  " cell-fmt)
+        rule      (str/join "  " (map #(apply str (repeat % \─)) widths))]
+    (println (dim (apply format hdr-fmt (map str headers))))
+    (println (dim rule))
+    (doseq [r rows]
+      (println (apply format row-fmt
+                      (map (fn [v n?]
+                             (cond
+                               (nil? v) ""
+                               n?       (fmt-num v)
+                               :else    (str v)))
+                           r col-num?))))))
+
+(defn- status-line
+  "Print a trailing OK / FAILED line. `text` defaults to the verdict
+  word itself."
+  ([ok?] (status-line ok? (if ok? "OK" "FAILED")))
+  ([ok? text]
+   (println)
+   (println (if ok? (green text) (red text)))))
+
+;; ============================================================================
+;; JSON emitter (unchanged from the previous CLI, just minus the now
+;; redundant clojure.walk require)
 
 (defn- bytes->hex-str [^bytes ba]
   (let [sb (StringBuilder.)]
@@ -80,11 +189,11 @@
 
 (defn- ->json [v]
   (cond
-    (nil? v)        "null"
-    (boolean? v)    (if v "true" "false")
-    (number? v)     (str v)
-    (string? v)     (escape-string v)
-    (keyword? v)    (escape-string (subs (str v) 1))
+    (nil? v)                              "null"
+    (boolean? v)                          (if v "true" "false")
+    (number? v)                           (str v)
+    (string? v)                           (escape-string v)
+    (keyword? v)                          (escape-string (subs (str v) 1))
     (instance? java.time.LocalDateTime v) (escape-string (str v))
     (map? v)
     (str "{"
@@ -93,103 +202,17 @@
                      (str (escape-string (if (keyword? k) (subs (str k) 1) (str k)))
                           ":" (->json val))))
          "}")
-    (set? v) (->json (vec (sort-by str v)))
+    (set? v)        (->json (vec (sort-by str v)))
     (sequential? v) (str "[" (str/join "," (map ->json v)) "]")
     (and (some? v) (.isArray ^Class (class v))
          (= "byte" (.getName (.getComponentType ^Class (class v)))))
     (escape-string (bytes->hex-str v))
     :else (escape-string (str v))))
 
-;; --- output helpers ------------------------------------------------------
-
-(defn- print-table [headers rows]
-  (let [widths (map (fn [i]
-                      (apply max (count (nth headers i))
-                             (map #(count (str (nth % i))) rows)))
-                    (range (count headers)))
-        fmt    (->> widths (map #(str "%-" % "s")) (str/join "  "))]
-    (println (apply format fmt headers))
-    (println (apply format fmt (map #(apply str (repeat % \-)) widths)))
-    (doseq [r rows]
-      (println (apply format fmt (map str r))))))
-
 (defn- emit [json? human-thunk data]
   (if json?
     (do (println (->json data)) (flush))
     (human-thunk)))
-
-;; --- commands -------------------------------------------------------------
-
-(defn- list-entries [f flags json?]
-  (let [match   (loop [xs flags]
-                  (cond
-                    (empty? xs)        nil
-                    (= "--match" (first xs)) (second xs)
-                    :else              (recur (rest xs))))
-        ;; Substring by default; if the pattern looks regex-y, compile it.
-        match*  (when match
-                  (try (re-pattern match)
-                       (catch Exception _ match)))
-        entries (zm/zip-entries f (cond-> {} match* (assoc :match match*)))]
-    (emit json?
-          (fn []
-            (print-table ["compressed" "uncompressed" "modified" "name"]
-                         (mapv (fn [e]
-                                 [(:compressed-size e)
-                                  (:uncompressed-size e)
-                                  (or (:last-modified e) "")
-                                  (:file-name e)])
-                               entries)))
-          entries)))
-
-(defn- print-summary [f json?]
-  (let [s (zm/summarize f)]
-    (emit json? #(pp/pprint s) s)))
-
-(defn- print-meta [f json?]
-  (let [m (zm/zip-meta f)]
-    (emit json? #(zm/print-zip-meta m) m)))
-
-(defn- comment-cmd [f new-comment json?]
-  (if new-comment
-    (do (zm/set-zip-comment! f new-comment)
-        (emit json? #(println "comment updated")
-              {:status "updated" :comment new-comment}))
-    (let [c (zm/zip-comment f)]
-      (emit json? #(println c) {:comment c}))))
-
-(defn- validate-cmd [f flags json?]
-  (let [crc? (contains? (set flags) "--crc")
-        r    (zm/validate-zip-meta f :verify-crcs crc?)]
-    (emit json?
-          (fn []
-            (println (str "extra-bytes: " (:extra-bytes r)))
-            (if (:valid? r)
-              (println "OK")
-              (do (println "FAILED")
-                  (run! #(println (str "  - " %)) (:issues r)))))
-          r)
-    (when-not (:valid? r) (System/exit 1))))
-
-(defn- verify-cmd [f json?]
-  (let [s (zm/verify-crcs-summary f)]
-    (emit json?
-          (fn []
-            (println (str "total:    " (:total s)))
-            (doseq [[st n] (sort-by key (:counts s))]
-              (println (format "  %-22s %d" (name st) n)))
-            (if (:valid? s)
-              (println "OK")
-              (do (when (seq (:mismatches s))
-                    (println "mismatches:")
-                    (doseq [m (:mismatches s)]
-                      (println (str "  - " (:file-name m)))))
-                  (when (seq (:errors s))
-                    (println "errors:")
-                    (doseq [m (:errors s)]
-                      (println (str "  - " (:file-name m) ": " (:error m))))))))
-          s)
-    (when-not (:valid? s) (System/exit 1))))
 
 (defn- flag-value
   "Find `--name` in `flags` and return its succeeding token, or
@@ -197,54 +220,196 @@
   [flags name default]
   (loop [xs flags]
     (cond
-      (empty? xs)         default
-      (= name (first xs)) (second xs)
-      :else               (recur (rest xs)))))
+      (empty? xs)              default
+      (= name (first xs))      (second xs)
+      :else                    (recur (rest xs)))))
+
+;; ============================================================================
+;; Commands
+
+(defn- list-cmd [f flags json?]
+  (let [match   (flag-value flags "--match" nil)
+        match*  (when match
+                  (try (re-pattern match) (catch Exception _ match)))
+        entries (zm/zip-entries f (cond-> {} match* (assoc :match match*)))]
+    (emit json?
+          (fn []
+            (title "list" f)
+            (when match (subtitle (str "matching " (pr-str match))))
+            (println)
+            (print-table
+              ["name" "compressed" "uncompressed" "modified"]
+              (mapv (fn [e]
+                      [(:file-name e)
+                       (:compressed-size e)
+                       (:uncompressed-size e)
+                       (if-let [m (:last-modified e)] (str m) "")])
+                    entries))
+            (println)
+            (println (dim (str (count entries) " entr" (if (= 1 (count entries)) "y" "ies")))))
+          entries)))
+
+(defn- summary-cmd [f json?]
+  (let [s (zm/summarize f)]
+    (emit json?
+          (fn []
+            (title "summary" f)
+            (println)
+            (kv-block
+              [["entries"            (fmt-num (:entry-count s))]
+               ["extra bytes"        (fmt-num (:extra-bytes s))]
+               ["total compressed"   (fmt-num (:total-compressed s))]
+               ["total uncompressed" (fmt-num (:total-uncompressed s))]
+               ["zip comment"
+                (let [c (:zip-comment s)]
+                  (if (str/blank? c) (dim "(none)") c))]]))
+          s)))
+
+(defn- meta-cmd [f json?]
+  (let [m (zm/zip-meta f)]
+    (emit json? #(zm/print-zip-meta m) m)))
+
+(defn- comment-cmd [f new-comment json?]
+  (if new-comment
+    (do (zm/set-zip-comment! f new-comment)
+        (emit json?
+              (fn []
+                (title "comment" f)
+                (println)
+                (kv-block [["new comment" new-comment]])
+                (status-line true "UPDATED"))
+              {:status "updated" :comment new-comment}))
+    (let [c (zm/zip-comment f)]
+      (emit json?
+            (fn []
+              (title "comment" f)
+              (println)
+              (if (str/blank? c)
+                (println (dim "  (no comment)"))
+                (kv-block [["comment" c]])))
+            {:comment c}))))
+
+(defn- validate-cmd [f flags json?]
+  (let [crc? (contains? (set flags) "--crc")
+        r    (zm/validate-zip-meta f :verify-crcs crc?)]
+    (emit json?
+          (fn []
+            (title "validate" f)
+            (println)
+            (kv-block [["extra bytes" (fmt-num (:extra-bytes r))]
+                       ["crc check"   (if crc? "yes" "no")]])
+            (when (seq (:issues r))
+              (subtitle "issues")
+              (doseq [i (:issues r)]
+                (println (str "  " (red "•") " " i))))
+            (status-line (:valid? r)))
+          r)
+    (when-not (:valid? r) (System/exit 1))))
+
+(defn- verify-cmd [f json?]
+  (let [s (zm/verify-crcs-summary f)]
+    (emit json?
+          (fn []
+            (title "verify" f)
+            (println)
+            (let [counts (:counts s)
+                  ;; Stable, sensible ordering: ok, mismatch, empty,
+                  ;; unsupported-method, error, then anything else.
+                  order  [:ok :mismatch :empty :unsupported-method :error]
+                  shown  (concat (filter counts order)
+                                 (remove (set order) (keys counts)))
+                  rows   (for [k shown] [(name k) (get counts k 0)])
+                  lw     (max-width (map first rows))
+                  vw     (max-width (map #(fmt-num (second %)) rows))]
+              (doseq [[k n] rows]
+                (let [colored (case k
+                                "ok"        (green k)
+                                "mismatch"  (red   k)
+                                "error"     (red   k)
+                                "unsupported-method" (yellow k)
+                                k)]
+                  (println (format (str "  %-" lw "s  %" vw "s")
+                                   colored (fmt-num n)))))
+              (println (str "  " (apply str (repeat (+ lw 2 vw) \─))))
+              (println (format (str "  %-" lw "s  %" vw "s")
+                               (bold "total") (fmt-num (:total s)))))
+            (when (seq (:mismatches s))
+              (subtitle "mismatches")
+              (doseq [m (:mismatches s)]
+                (println (str "  " (red "•") " " (:file-name m)))))
+            (when (seq (:errors s))
+              (subtitle "errors")
+              (doseq [m (:errors s)]
+                (println (format "  %s %s -- %s"
+                                 (red "•") (:file-name m) (:error m)))))
+            (status-line (:valid? s)))
+          s)
+    (when-not (:valid? s) (System/exit 1))))
 
 (defn- tree-cmd [f flags json?]
-  (let [match  (flag-value flags "--match" nil)
-        match* (when match (try (re-pattern match) (catch Exception _ match)))
+  (let [match   (flag-value flags "--match" nil)
+        match*  (when match (try (re-pattern match) (catch Exception _ match)))
         entries (zm/zip-entries f (cond-> {} match* (assoc :match match*)))
-        ;; Build a nested map: {part {part {... {nil :leaf-name}}}}.
         tree    (reduce
                   (fn [acc {:keys [file-name]}]
-                    (let [segs (str/split file-name #"/")
-                          last? #(= (count %) 1)
+                    (let [segs     (str/split file-name #"/")
                           path-vec (vec (butlast segs))
                           leaf     (last segs)]
                       (if (str/ends-with? file-name "/")
-                        (update-in acc (mapv #(str % "/") segs) #(or % (sorted-map)))
-                        (assoc-in acc (conj (mapv #(str % "/") path-vec) leaf) :file))))
+                        (update-in acc (mapv #(str % "/") segs)
+                                   #(or % (sorted-map)))
+                        (assoc-in acc
+                                  (conj (mapv #(str % "/") path-vec) leaf)
+                                  :file))))
                   (sorted-map)
                   entries)]
     (emit json?
           (fn []
-            (println f)
+            (title "tree" f)
+            (println)
             (letfn [(walk [node prefix]
                       (let [ks (vec (keys node))]
                         (doseq [[i k] (map-indexed vector ks)]
                           (let [last?    (= i (dec (count ks)))
                                 marker   (if last? "└── " "├── ")
                                 continue (if last? "    " "│   ")
-                                v        (get node k)]
-                            (println (str prefix marker k))
-                            (when (map? v)
-                              (walk v (str prefix continue)))))))]
+                                v        (get node k)
+                                dir?     (map? v)]
+                            (println (str prefix (dim marker)
+                                          (if dir? (cyan k) k)))
+                            (when dir? (walk v (str prefix continue)))))))]
               (walk tree "")))
           tree)))
 
 (defn- inspect-cmd [f entry-name json?]
   (let [e (zm/find-entry f entry-name)]
     (if-not e
-      (do (println (str "no entry named " (pr-str entry-name)))
+      (do (println (red (str "no entry named " (pr-str entry-name))))
           (System/exit 1))
       (emit json?
             (fn []
-              (doseq [k [:file-name :file-comment :compressed-size
-                         :uncompressed-size :crc-32 :compression-method
-                         :offset :directory? :symlink? :encrypted?
-                         :last-modified :unix-mode :dos-attributes]]
-                (println (format "%-22s %s" (str (name k) ":") (pr-str (get e k))))))
+              (title "inspect" f)
+              (subtitle entry-name)
+              (let [fmt-attrs (fn [s] (if (seq s)
+                                        (str/join " " (map name s))
+                                        (dim "(none)")))
+                    fmt-mode  (fn [m] (when m (format "%d (0o%o)" m m)))]
+                (kv-block
+                  [["file-name"          (:file-name e)]
+                   ["file-comment"
+                    (let [c (:file-comment e)]
+                      (if (str/blank? c) (dim "(none)") c))]
+                   ["compressed-size"    (fmt-num (:compressed-size e))]
+                   ["uncompressed-size"  (fmt-num (:uncompressed-size e))]
+                   ["compression-method" (:compression-method e)]
+                   ["crc-32"             (:crc-32 e)]
+                   ["offset"             (fmt-num (:offset e))]
+                   ["last-modified"      (:last-modified e)]
+                   ["directory?"         (:directory? e)]
+                   ["symlink?"           (:symlink? e)]
+                   ["encrypted?"         (:encrypted? e)]
+                   ["unix-mode"          (fmt-mode (:unix-mode e))]
+                   ["dos-attributes"     (fmt-attrs (:dos-attributes e))]])))
             e))))
 
 (defn- grep-cmd [f pattern json?]
@@ -253,28 +418,38 @@
     (emit json?
           (fn []
             (doseq [e entries] (println (:file-name e))))
-          (mapv :file-name entries))))
+          (mapv :file-name entries))
+    (when (empty? entries) (System/exit 1))))
 
 (defn- layout-cmd [f flags json?]
   (let [w-arg (flag-value flags "--width" nil)
         width (if w-arg (Long/parseLong w-arg) 0)]
     (if json?
       (do (println (->json (zm/layout f))) (flush))
-      (zm/print-layout f {:width width}))))
+      (do (title "layout" f) (println)
+          (zm/print-layout f {:width width})))))
 
 (defn- manifest-cmd [f json?]
   (if-let [m (zm/manifest f)]
     (emit json?
           (fn []
-            (doseq [[k v] (sort-by key m)]
-              (println (format "%-30s %s" (str k ":") v))))
+            (title "manifest" f)
+            (println)
+            (kv-block (sort-by first m)))
           m)
-    (do (println "no MANIFEST.MF in this archive") (System/exit 1))))
+    (do (println (red "no MANIFEST.MF in this archive"))
+        (System/exit 1))))
 
 (defn- jar-info-cmd [f json?]
   (if-let [info (zm/jar-info f)]
-    (emit json? #(pp/pprint info) info)
-    (do (println "no MANIFEST.MF in this archive") (System/exit 1))))
+    (emit json?
+          (fn []
+            (title "jar-info" f)
+            (println)
+            (kv-block (for [[k v] (sort-by key info)] [(name k) v])))
+          info)
+    (do (println (red "no MANIFEST.MF in this archive"))
+        (System/exit 1))))
 
 (defn- describe-cmd [f json?]
   (let [d (zm/describe f)]
@@ -282,61 +457,104 @@
           (fn []
             (let [{:keys [summary jar-info pom-info
                           class-count resource-count top-level-dirs]} d]
-              (println (str "entries:        " (:entry-count summary)
-                            " (" class-count " classes, " resource-count " resources)"))
-              (println (str "uncompressed:   " (:total-uncompressed summary) " bytes"))
-              (println (str "compressed:     " (:total-compressed   summary) " bytes"))
-              (when (seq (:zip-comment summary))
-                (println (str "archive-comment: " (:zip-comment summary))))
+              (title "describe" f)
+              (println)
+              (kv-block
+                [["entries"            (str (fmt-num (:entry-count summary))
+                                            "  "
+                                            (dim (str "("
+                                                      (fmt-num class-count) " classes, "
+                                                      (fmt-num resource-count) " resources)")))]
+                 ["uncompressed bytes" (fmt-num (:total-uncompressed summary))]
+                 ["compressed bytes"   (fmt-num (:total-compressed   summary))]
+                 ["zip comment"
+                  (let [c (:zip-comment summary)]
+                    (if (str/blank? c) (dim "(none)") c))]])
               (when jar-info
-                (println "manifest:")
-                (doseq [[k v] (sort-by key jar-info)]
-                  (println (format "  %-22s %s" (str (name k) ":") v))))
+                (subtitle "manifest")
+                (kv-block (for [[k v] (sort-by key jar-info)] [(name k) v])))
               (when pom-info
-                (println "maven:")
-                (doseq [[k v] (sort-by key pom-info)]
-                  (println (format "  %-22s %s" (str (name k) ":") v))))
+                (subtitle "maven")
+                (kv-block (for [[k v] (sort-by key pom-info)] [(name k) v])))
               (when (seq top-level-dirs)
-                (println (str "top-level dirs: " (str/join " " top-level-dirs))))))
+                (subtitle "top-level dirs")
+                (doseq [d top-level-dirs]
+                  (println (str "  " (cyan d)))))))
           d)))
 
-(defn- classes-cmd [f json?]
-  (let [idx (zm/class-index f)]
+(defn- classes-cmd [f flags json?]
+  (let [all?   (contains? (set flags) "--all")
+        idx    (zm/class-index f)
+        total  (reduce + 0 (map count (vals idx)))]
     (emit json?
           (fn []
-            (doseq [[pkg cs] idx]
-              (println (str (if (empty? pkg) "<root>" pkg)
-                            " (" (count cs) ")"))
-              (doseq [c cs] (println (str "  " c)))))
+            (title "classes" f)
+            (println)
+            (cond
+              (empty? idx)
+              (println (dim "  (no .class entries)"))
+
+              all?
+              (do
+                (doseq [[pkg cs] idx]
+                  (println (cyan (if (empty? pkg) "<root>" pkg))
+                           (dim (str "(" (fmt-num (count cs)) ")")))
+                  (doseq [c cs] (println (str "  " c)))
+                  (println))
+                (println (dim (str (fmt-num total) " classes in "
+                                   (count idx) " packages"))))
+
+              :else
+              (do
+                (kv-block
+                  (for [[pkg cs] (sort-by (comp - count val) idx)]
+                    [(if (empty? pkg) "<root>" pkg) (fmt-num (count cs))]))
+                (println)
+                (println (dim (str (fmt-num total) " classes in "
+                                   (count idx) " packages")))
+                (println (dim "(pass --all to list every class)")))))
           idx)))
 
 (defn- spi-cmd [f json?]
   (let [m (zm/spi-providers f)]
     (emit json?
           (fn []
+            (title "spi" f)
             (if (empty? m)
-              (println "no META-INF/services entries")
-              (doseq [[iface impls] m]
-                (println iface)
-                (doseq [c impls] (println (str "  " c))))))
+              (do (println) (println (dim "  (no META-INF/services entries)")))
+              (do (println)
+                  (doseq [[iface impls] m]
+                    (println (cyan iface))
+                    (doseq [c impls] (println (str "  " c)))
+                    (println)))))
           m)))
 
 (defn- duplicate-classes-cmd [jars json?]
   (let [m (zm/duplicate-classes jars)]
     (emit json?
           (fn []
+            (println (bold (str "duplicate-classes  "
+                                (count jars) " jars")))
+            (println)
             (if (empty? m)
-              (println "no duplicate classes across these jars")
-              (doseq [[cls jars] m]
-                (println cls)
-                (doseq [j jars] (println (str "  " j))))))
+              (do (println (green "OK") (dim " — no duplicate classes")))
+              (do (println (red (str (fmt-num (count m))
+                                     " duplicate class(es)")))
+                  (println)
+                  (doseq [[cls jars] m]
+                    (println (cyan cls))
+                    (doseq [j jars]
+                      (println (str "  " (path-short j)
+                                    "  " (dim j)))))
+                  (println))))
           m)
     (when (seq m) (System/exit 2))))
 
 (defn- cat-cmd [f entry-name]
   (if-let [ba (zm/extract-bytes f entry-name)]
     (.write (System/out) ^bytes ba)
-    (do (println (str "no entry named " (pr-str entry-name))) (System/exit 1))))
+    (do (println (red (str "no entry named " (pr-str entry-name))))
+        (System/exit 1))))
 
 (defn- analyze-cmd [f flags json?]
   (let [recursive? (contains? (set flags) "--recursive")
@@ -344,46 +562,59 @@
         nested     (when recursive? (za/analyze-nested f))]
     (emit json?
           (fn []
-            (println (str "safe?:               " (:safe? r)))
-            (println (str "file-size:           " (:file-size r)))
-            (println (str "entry-count:         " (:entry-count r)))
-            (println (str "zip64?:              " (:zip64? r)))
+            (title "analyze" f)
+            (println)
+            (kv-block
+              [["safe?"        (if (:safe? r) (green "yes") (red "no"))]
+               ["file size"    (fmt-num (:file-size r))]
+               ["entries"      (fmt-num (:entry-count r))]
+               ["zip64?"       (if (:zip64? r) (yellow "yes") "no")]])
             (let [u (:unsafe-entries r)]
-              (println (str "unsafe-entries (" (count u) "):"))
-              (doseq [{:keys [entry reasons]} u]
-                (println (format "  %s -- %s"
-                                 (:file-name entry)
-                                 (str/join ", " (map name reasons))))))
+              (when (seq u)
+                (subtitle (str "unsafe entries (" (count u) ")"))
+                (doseq [{:keys [entry reasons]} u]
+                  (println (format "  %s %s %s"
+                                   (red "!")
+                                   (:file-name entry)
+                                   (dim (str "[" (str/join ", " (map name reasons)) "]")))))))
             (let [b (:zip-bomb-risks r)]
-              (println (str "zip-bomb-risks (" (count b) "):"))
-              (doseq [e (take 5 b)]
-                (println (format "  %.0f:1  %s"
-                                 (:compression-ratio e)
-                                 (:file-name e)))))
+              (when (seq b)
+                (subtitle (str "zip-bomb risks (" (count b) ")"))
+                (doseq [e (take 5 b)]
+                  (println (format "  %s %.0f:1  %s"
+                                   (red "!")
+                                   (:compression-ratio e)
+                                   (:file-name e))))))
             (let [g (:gap-data r)]
-              (println (str "gap-data (" (count g) "):"))
-              (doseq [{:keys [start end length]} g]
-                (println (format "  %d-%d  (%d bytes)" start end length))))
+              (when (seq g)
+                (subtitle (str "gap data (" (count g) ")"))
+                (doseq [{:keys [start end length]} g]
+                  (println (format "  %s %s-%s (%s bytes)"
+                                   (yellow "!")
+                                   (fmt-num start) (fmt-num end)
+                                   (fmt-num length))))))
             (let [m (:cdr-lfh-mismatches r)]
-              (println (str "cdr-lfh-mismatches (" (count m) "):"))
-              (doseq [{:keys [file-name differences]} m]
-                (println (format "  %s -- fields differ: %s"
-                                 file-name
-                                 (str/join ", " (map name (keys differences)))))))
+              (when (seq m)
+                (subtitle (str "cdr / lfh mismatches (" (count m) ")"))
+                (doseq [{:keys [file-name differences]} m]
+                  (println (format "  %s %s %s"
+                                   (red "!")
+                                   file-name
+                                   (dim (str/join ", " (map name (keys differences)))))))))
             (when (seq nested)
-              (println)
-              (println (str "nested archives (" (count nested) "):"))
+              (subtitle (str "nested archives (" (count nested) ")"))
               (doseq [{:keys [entry-name analysis error]} nested]
                 (println (format "  %s %s"
-                                 (if (:safe? analysis) "[OK]" "[!!]")
+                                 (if (:safe? analysis) (green "✓") (red "✗"))
                                  entry-name))
                 (when error
-                  (println (str "      error: " error)))
-                (when-let [u (seq (:unsafe-entries analysis))]
-                  (doseq [{e :entry rs :reasons} u]
-                    (println (format "      unsafe: %s -- %s"
-                                     (:file-name e)
-                                     (str/join "," (map name rs)))))))))
+                  (println (str "      " (red "error: ") error)))
+                (doseq [{e :entry rs :reasons} (:unsafe-entries analysis)]
+                  (println (format "      %s %s %s"
+                                   (red "!")
+                                   (:file-name e)
+                                   (dim (str/join ", " (map name rs))))))))
+            (status-line (:safe? r) (if (:safe? r) "SAFE" "UNSAFE")))
           (cond-> r recursive? (assoc :nested nested)))
     (when-not (:safe? r) (System/exit 1))))
 
@@ -391,30 +622,50 @@
   (let [d (zm/diff a b)]
     (emit json?
           (fn []
-            (let [{:keys [added removed changed same]} d]
-              (println (str "same:    " same))
+            (println (bold (str "diff  " (path-short a)
+                                "  ⇄  " (path-short b))))
+            (let [{:keys [added removed changed same]} d
+                  total-changes (+ (count added) (count removed) (count changed))]
+              (println)
+              (kv-block
+                [["unchanged" (fmt-num same)]
+                 ["added"     (let [n (fmt-num (count added))]
+                                (if (zero? (count added)) n (green n)))]
+                 ["removed"   (let [n (fmt-num (count removed))]
+                                (if (zero? (count removed)) n (red n)))]
+                 ["changed"   (let [n (fmt-num (count changed))]
+                                (if (zero? (count changed)) n (yellow n)))]])
               (when (seq added)
-                (println (str "added (" (count added) "):"))
+                (subtitle (str "added (" (count added) ")"))
                 (doseq [e added]
-                  (println (format "  + %14d  %s"
-                                   (:uncompressed-size e) (:file-name e)))))
+                  (println (format "  %s %14s  %s"
+                                   (green "+")
+                                   (fmt-num (:uncompressed-size e))
+                                   (:file-name e)))))
               (when (seq removed)
-                (println (str "removed (" (count removed) "):"))
+                (subtitle (str "removed (" (count removed) ")"))
                 (doseq [e removed]
-                  (println (format "  - %14d  %s"
-                                   (:uncompressed-size e) (:file-name e)))))
+                  (println (format "  %s %14s  %s"
+                                   (red "-")
+                                   (fmt-num (:uncompressed-size e))
+                                   (:file-name e)))))
               (when (seq changed)
-                (println (str "changed (" (count changed) "):"))
+                (subtitle (str "changed (" (count changed) ")"))
                 (doseq [{:keys [file-name before after]} changed]
-                  (println (format "  ~ %s" file-name))
-                  (println (format "      before: csize=%d usize=%d crc=%d"
-                                   (:compressed-size before)
-                                   (:uncompressed-size before)
+                  (println (str "  " (yellow "~ ") file-name))
+                  (println (format "      %s csize=%s usize=%s crc=%s"
+                                   (dim "before:")
+                                   (fmt-num (:compressed-size before))
+                                   (fmt-num (:uncompressed-size before))
                                    (:crc-32 before)))
-                  (println (format "      after:  csize=%d usize=%d crc=%d"
-                                   (:compressed-size after)
-                                   (:uncompressed-size after)
-                                   (:crc-32 after)))))))
+                  (println (format "      %s csize=%s usize=%s crc=%s"
+                                   (dim "after: ")
+                                   (fmt-num (:compressed-size after))
+                                   (fmt-num (:uncompressed-size after))
+                                   (:crc-32 after)))))
+              (when (zero? total-changes)
+                (println)
+                (println (green "identical")))))
           d)
     (when (or (seq (:added d)) (seq (:removed d)) (seq (:changed d)))
       (System/exit 2))))
@@ -427,49 +678,71 @@
 
 (defn- repair-cmd [f flags json?]
   (let [strip? (contains? (set flags) "--strip")
-        r      (zm/repair-zip f {:strip-preamble strip?})]
+        r      (zm/repair-zip f {:strip-preamble strip?})
+        ok?    (= :ok (:status r))]
     (emit json?
           (fn []
-            (println (str "status:  " (name (:status r))))
-            (println (str "actions: " (str/join ", " (map name (:actions r)))))
-            (when (= :failed (:status r))
-              (when (:error r) (println (str "error:   " (:error r))))
-              (run! #(println (str "issue:   " %)) (or (:issues r) []))))
+            (title "repair" f)
+            (println)
+            (kv-block
+              [["status"  (if ok? (green "ok") (red "failed"))]
+               ["actions" (if (seq (:actions r))
+                            (str/join ", " (map name (:actions r)))
+                            (dim "(none)"))]])
+            (when-not ok?
+              (when (:error r)
+                (subtitle "error")
+                (println (str "  " (red (:error r)))))
+              (when (seq (:issues r))
+                (subtitle "issues")
+                (doseq [i (:issues r)]
+                  (println (str "  " (red "•") " " i)))))
+            (status-line ok?))
           (-> r
               (update :status name)
               (update :actions #(mapv name %))))
-    (when (= :failed (:status r)) (System/exit 1))))
+    (when-not ok? (System/exit 1))))
+
+;; ============================================================================
+;; Entry point
 
 (defn -main [& args]
   (when (some #(= "--version" %) args)
     (println (str "clj-zip-meta " version))
     (flush)
     (System/exit 0))
-  (let [json? (boolean (some #(= "--json" %) args))
-        args  (remove #(= "--json" %) args)
-        [cmd file & rest] args]
-    (case cmd
-      "list"     (list-entries file rest json?)
-      "tree"     (tree-cmd file rest json?)
-      "meta"     (print-meta file json?)
-      "summary"  (print-summary file json?)
-      "inspect"  (inspect-cmd file (first rest) json?)
-      "grep"     (grep-cmd file (first rest) json?)
-      "comment"  (comment-cmd file (first rest) json?)
-      "validate" (validate-cmd file rest json?)
-      "verify"   (verify-cmd file json?)
-      "repair"   (repair-cmd file rest json?)
-      "diff"     (diff-cmd file (first rest) json?)
-      "layout"   (layout-cmd file rest json?)
-      "hexdump"  (hexdump-cmd file (first rest) (second rest) json?)
-      "analyze"  (analyze-cmd file rest json?)
-      "manifest" (manifest-cmd file json?)
-      "jar-info" (jar-info-cmd file json?)
-      "describe" (describe-cmd file json?)
-      "classes"  (classes-cmd file json?)
-      "spi"      (spi-cmd file json?)
-      "duplicate-classes" (duplicate-classes-cmd (cons file rest) json?)
-      "cat"      (cat-cmd file (first rest))
-      (do (println usage)
-          (flush)
-          (System/exit (if cmd 1 0))))))
+  (let [json?    (boolean (some #(= "--json" %) args))
+        no-col?  (boolean (some #(= "--no-color" %) args))
+        args     (remove #{"--json" "--no-color"} args)
+        [cmd file & rest] args
+        tty?     (some? (System/console))
+        term     (System/getenv "TERM")]
+    (binding [*color?* (and (not json?)
+                            (not no-col?)
+                            tty?
+                            (not= "dumb" term))]
+      (case cmd
+        "list"     (list-cmd file rest json?)
+        "tree"     (tree-cmd file rest json?)
+        "meta"     (meta-cmd file json?)
+        "summary"  (summary-cmd file json?)
+        "inspect"  (inspect-cmd file (first rest) json?)
+        "grep"     (grep-cmd file (first rest) json?)
+        "comment"  (comment-cmd file (first rest) json?)
+        "validate" (validate-cmd file rest json?)
+        "verify"   (verify-cmd file json?)
+        "repair"   (repair-cmd file rest json?)
+        "diff"     (diff-cmd file (first rest) json?)
+        "layout"   (layout-cmd file rest json?)
+        "hexdump"  (hexdump-cmd file (first rest) (second rest) json?)
+        "analyze"  (analyze-cmd file rest json?)
+        "manifest" (manifest-cmd file json?)
+        "jar-info" (jar-info-cmd file json?)
+        "describe" (describe-cmd file json?)
+        "classes"  (classes-cmd file rest json?)
+        "spi"      (spi-cmd file json?)
+        "duplicate-classes" (duplicate-classes-cmd (cons file rest) json?)
+        "cat"      (cat-cmd file (first rest))
+        (do (println usage)
+            (flush)
+            (System/exit (if cmd 1 0)))))))

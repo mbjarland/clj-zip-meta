@@ -6,6 +6,29 @@ and the format of [keepachangelog.com](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-05-23
+
+### Changed
+- **CLI output rewrite.** Every command got a fresh, consistent
+  layout: bold title row (`command  filename`), 2-space-indented
+  body, aligned key/value blocks with right-aligned numeric
+  columns, dim section subheaders, and a coloured `OK` / `FAILED`
+  status line at the end where applicable.
+  - Numeric values use comma-thousands separators
+    (`3,770`, not `3770`).
+  - Tables use light box-drawing rules instead of dashed `------`.
+  - `print-layout` reformats with right-aligned numbers and tight
+    column widths.
+  - ANSI colour codes only print when stdout is a real TTY and
+    neither `--json` nor `--no-color` is set.
+- `classes`: default view is a `pkg -> count` summary; pass
+  `--all` for the full per-package listing.
+- `grep`: exits 1 when no entry matches (matches POSIX `grep`
+  convention; lets shell scripts react).
+
+### Added
+- `--no-color` global flag.
+
 ## [0.5.0] - 2026-05-23
 
 ### Added — entry inspection
@@ -278,7 +301,8 @@ and the format of [keepachangelog.com](https://keepachangelog.com/).
   local file headers from zip/jar files; repair offsets after prepending
   preamble bytes.
 
-[Unreleased]: https://github.com/mbjarland/clj-zip-meta/compare/0.5.0...HEAD
+[Unreleased]: https://github.com/mbjarland/clj-zip-meta/compare/0.5.1...HEAD
+[0.5.1]: https://github.com/mbjarland/clj-zip-meta/compare/0.5.0...0.5.1
 [0.5.0]: https://github.com/mbjarland/clj-zip-meta/compare/0.4.0...0.5.0
 [0.4.0]: https://github.com/mbjarland/clj-zip-meta/compare/0.3.0...0.4.0
 [0.3.0]: https://github.com/mbjarland/clj-zip-meta/compare/0.2.0...0.3.0
