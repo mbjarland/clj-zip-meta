@@ -454,6 +454,14 @@ archive validate cleanly afterwards.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Project history
+
+For the long-form narrative of how the library got from 0.1.3
+(2018) to 0.5.x (2026) — the perf rewrite, the babashka work, the
+forensics suite, the TUI polish — see
+[doc/RELEASE_NOTES.md](doc/RELEASE_NOTES.md). Per-version change
+detail is in [CHANGELOG.md](CHANGELOG.md).
+
 ## License
 
 Copyright © 2017–2026 Matias Bjarland

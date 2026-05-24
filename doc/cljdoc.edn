@@ -1,5 +1,6 @@
 {:cljdoc.doc/tree
  [["Readme"        {:file "README.md"}]
   ["Introduction"  {:file "doc/intro.md"}]
+  ["Release notes" {:file "doc/RELEASE_NOTES.md"}]
   ["Changelog"     {:file "CHANGELOG.md"}]
   ["Contributing"  {:file "CONTRIBUTING.md"}]]}
