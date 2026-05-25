@@ -103,7 +103,7 @@ bb -m clj-zip-meta.cli repair my.jar
 ```clojure
 {:deps {clj-zip-meta/clj-zip-meta
         {:git/url "https://github.com/mbjarland/clj-zip-meta"
-         :git/tag "v0.5.0"}}}
+         :git/tag "v0.5.2"}}}
 ```
 
 Requires Clojure 1.10+ and JDK 11+ for normal use, or Babashka 1.0+
